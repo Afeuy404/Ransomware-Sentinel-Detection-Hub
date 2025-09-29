@@ -1,0 +1,335 @@
+// [Ransomware - Stage 2] Persistence Mechanisms Techniques
+let timeRange = 90d;
+let binSize   = 15m;
+// 1️⃣ Scheduled Task Creation
+let SuspiciousTaskCreation =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "schtasks.exe" or FileName =~ "schtasks.com" or ProcessCommandLine has "schtasks"
+| where ProcessCommandLine has "/create"
+| project-keep TimeGenerated, DeviceId, DeviceName, AccountName, InitiatingProcessAccountName,
+               FileName, ProcessCommandLine, InitiatingProcessFileName,
+               InitiatingProcessVersionInfoCompanyName, InitiatingProcessSignatureStatus
+// Normalisation & extraction
+| extend cmd = tolower(ProcessCommandLine)
+| extend tn  = tolower(extract(@"(?i)/tn\s+""?([^""]+)""?", 1, cmd))
+| extend xml = tolower(extract(@"(?i)/xml\s+""?([^""]+)""?", 1, cmd))
+| extend tr  = tolower(extract(@"(?i)/tr\s+""?([^""]+)""?", 1, cmd))
+// Signaux à conserver (TTP forts + cas discrets utiles)
+| extend is_msi_remote = cmd matches regex @"(?i)\bmsiexec(\.exe)?\b.*\b(/i|/package)\b.*(https?://|\\\\)"
+| extend mo = toint(extract(@"(?i)/mo\s+(\d+)", 1, cmd))
+| extend short_interval = cmd has "/sc minute" and (isnull(mo) or mo <= 5)
+| where
+      cmd has_any (dynamic([ "powershell","wscript.exe","cscript.exe","mshta.exe","rundll32","regsvr32", "bitsadmin","certutil","curl","ftp.exe","-enc","-encodedcommand","-w hidden", "http://","https://","\\\\" ]))
+   or cmd matches regex @"(?i)\.(ps1|bat|cmd|vbs|js)\b"
+   or (isnotempty(tr) and tr has_any (dynamic(["\\appdata\\","\\users\\public\\","\\programdata\\","\\temp\\", "\\Download\\"])))
+   or cmd has_any (dynamic(["/ru system","/rl highest","/sc onlogon","/sc onstart","/sc onidle"]))
+   or is_msi_remote
+   or short_interval
+| where not (ProcessCommandLine contains "\\Program Files\\TeamViewer\\RollbackTemp\\TeamViewer_.exe" and ProcessCommandLine contains "/RU SYSTEM /SC ONLOGON")
+// Agrégation
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c = count(),
+            Commands = make_set(ProcessCommandLine, 5),
+            Parents  = make_set(InitiatingProcessFileName, 5),
+            ParentSignatures = make_set(InitiatingProcessSignatureStatus, 5),
+            Accounts = make_set(User),
+            FirstSeen = min(TimeGenerated)
+    by DeviceId, DeviceName, t2 = bin(TimeGenerated, 10m)
+| where c > 0
+| summarize EventCount = sum(c),
+            SampleCommands = make_set(Commands, 5),
+            SampleParents  = make_set(Parents, 5),
+            SampleParentSignatures = make_set(ParentSignatures, 5),
+            Accounts = make_set(Accounts),
+            FirstSeen = min(FirstSeen)
+    by DeviceId, DeviceName, TimeWindow = bin(t2, binSize)
+| extend
+    Signal = "Scheduled Tasks - Suspicious Creation",
+    Severity = "🟠 Medium",
+    PrimaryAccount = tostring(Accounts[0]),
+    Summary = strcat(
+      "⚠️ Suspicious scheduled task creation detected\n",
+      "• Who: ", strcat_array(Accounts, ", "), "\n",
+      "• What: ", tostring(EventCount), " schtasks /create with LOLBins, user-writable targets, or sensitive triggers\n",
+      "• Commands: ", tostring(SampleCommands), "\n",
+      "• Parent Processes: ", tostring(SampleParents),"\n",
+      "• Parent Signatures: ", tostring(SampleParentSignatures), "\n",
+      "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+      "• Device: ", DeviceId, " (", DeviceName, ")\n",
+      "🛑 Attackers use Windows scheduled tasks to persist and auto-execute payloads after logon or reboot."
+    );
+// 2️⃣ Disabling System Restore - Defense Evasion
+let SystemRestoreDisabled =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName in~ ("schtasks.exe", "regedit.exe")
+    | where ProcessCommandLine has_all ("SystemRestore", "disable", "Change")
+    | extend
+        IsSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Yes", "No"),
+        Path = tostring(FolderPath)
+    | summarize 
+        EventCount = count(),
+        Commands = make_set(strcat("[", ProcessCommandLine, "]"), 3),
+        ParentProcesses = make_set(InitiatingProcessFileName),
+        Accounts = make_set(AccountName),
+        Signatures = make_set(IsSigned),
+        Paths = make_set(Path),
+        FirstSeen = min(TimeGenerated)
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+    | where EventCount > 0
+    | extend
+        Signal = "System Restore Disabled",
+        Severity = "🔴 High",
+        PrimaryAccount = tostring(Accounts[0]),
+        Summary = strcat(
+            "⚠️ System Restore disabled via schtasks or regedit\n",
+            "• Who: ", strcat_array(Accounts, ", "), "\n",
+            "• Commands: ", strcat_array(Commands, " | "), "\n",
+            "• Parent Processes: ", strcat_array(ParentProcesses, " | "), "\n",
+            "• Signed: ", strcat_array(Signatures, ", "), "\n",
+            "• Paths: ", strcat_array(Paths, " | "), "\n",
+            "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+            "• Device: ", DeviceId, " (", DeviceName, ")\n",
+            "🛑 Disabling System Restore removes recovery options, making remediation more difficult after ransomware execution."
+        );
+//3️⃣Service Creation via sc.exe - Silent Persistence
+let SuspiciousServiceCreation =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName =~ "sc.exe"
+    | where ProcessCommandLine has_all ("create", ".exe")
+    | extend
+        IsSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Yes", "No"),
+        Path = tostring(FolderPath)
+    | summarize 
+        EventCount = count(),
+        Commands = make_set(strcat("[", ProcessCommandLine, "]"), 3),
+        Accounts = make_set(AccountName),
+        Parents = make_set(InitiatingProcessFileName),
+        Signatures = make_set(IsSigned),
+        Paths = make_set(Path),
+        FirstSeen = min(TimeGenerated)
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+    | where EventCount > 0
+    | extend CommandsText = strcat_array(Commands, " "),
+             PathsText = tostring(Paths)
+    | extend SuspiciousFlags =
+               iff(CommandsText contains "http://" or CommandsText contains "https://" or CommandsText contains "\\\\", 1, 0)
+               + iff(PathsText contains "\\appdata\\" or PathsText contains "\\temp\\" or PathsText contains "\\users\\public\\", 1, 0)
+               + iff((tostring(Signatures) contains "No") , 1, 0)
+               + iff((CommandsText contains "\\program files\\corsair\\") , -1, 0)
+    | extend Severity = case(SuspiciousFlags > 0, "🔴 High","🟠 Medium")
+    | extend
+        Signal = "Service Created via sc.exe",
+        PrimaryAccount = tostring(Accounts[0]),
+        Summary = strcat(
+            "⚠️ Suspicious service created via sc.exe\n",
+            "• Who: ", strcat_array(Accounts, ", "), "\n",
+            "• Commands: ", tostring(Commands), "\n",
+            "• Parent Processes: ", tostring(Parents), "\n",
+            "• Signed: ", tostring(Signatures), "\n",
+            "• Paths: ", tostring(Paths), "\n",
+            "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+            "• Device: ", DeviceId, " (", DeviceName, ")\n",
+            "🛑 Malicious actors create services to execute ransomware at boot time with elevated privileges."
+        );
+// 4️⃣ PowerShell-based service persistence (New/Set-Service) 
+let PS_NewOrSetService =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "powershell.exe"
+| where ProcessCommandLine has_any (dynamic(["New-Service","Set-Service"]))
+| extend cmd = tolower(ProcessCommandLine)
+| extend SuspiciousPSFlag = iff(cmd contains "-encodedcommand" or cmd contains " -enc "
+      or cmd matches regex @"(?i)frombase64string|invoke-expression|iex", 1, 0)
+| extend ParentSignedFlag = iff(InitiatingProcessSignatureStatus == "Valid", 1, 0)
+| summarize 
+    EventCount = count(),
+    Commands = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Accounts = make_set(AccountName),
+    Parents  = make_set(InitiatingProcessFileName, 5),
+    Parent   = tostring(max(InitiatingProcessFileName)),
+    ParentSignedFlag = max(ParentSignedFlag),
+    SuspiciousPS = max(SuspiciousPSFlag),
+    FirstSeen = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| extend ParentSigned = iff(ParentSignedFlag == 1, "Signed", "Unsigned")
+| extend Severity = case(SuspiciousPS == 1, "🔴 High","🟠 Medium")
+| extend
+  Signal = "PowerShell Service Persistence (New/Set-Service)",
+  PrimaryAccount = tostring(Accounts[0]),
+  Summary = strcat(
+    "⚠️ PowerShell service persistence activity\n",
+    "• Who: ", strcat_array(Accounts, ", "), "\n",
+    "• What: New/Set-Service used to create or modify a service\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Parent: ", Parent, " (", ParentSigned, ")\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Abuse of service creation/modification enables persistence with elevated privileges."
+  );
+// 5️⃣ WMI permanent subscription via wmic.exe
+let WMI_Wmic_Subscription =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "wmic.exe"
+| where ProcessCommandLine has_all (dynamic(["/namespace:\\\\root\\subscription","/CREATE"]))
+| summarize 
+    EventCount = count(),
+    Commands = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Accounts = make_set(AccountName),
+    Parent   = tostring(max(InitiatingProcessFileName)),
+    ParentSigned = tostring(max(InitiatingProcessSignatureStatus)),
+    FirstSeen = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| extend
+  Signal = "WMI Permanent Subscription (wmic)",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0]),
+  Summary = strcat(
+    "⚠️ WMI permanent subscription creation via wmic.exe\n",
+    "• Who: ", strcat_array(Accounts, ", "), "\n",
+    "• What: /namespace:\\root\\subscription /CREATE observed\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Parent: ", Parent, " (Signed: ", ParentSigned, ")\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 WMI permanent subscriptions provide stealthy, event-driven persistence."
+  );
+// 6️⃣ Scheduled task via PowerShell cmdlets
+let PS_ScheduledTasksCmdlets =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "powershell.exe"
+| where ProcessCommandLine has_any (dynamic(["Register-ScheduledTask","New-ScheduledTask","New-ScheduledTaskAction","New-ScheduledTaskTrigger"]))
+| summarize 
+    EventCount = count(),
+    Commands = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Accounts = make_set(AccountName),
+    Parent   = tostring(max(InitiatingProcessFileName)),
+    ParentSigned = tostring(max(InitiatingProcessSignatureStatus)),
+    FirstSeen = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| extend
+  Signal = "Scheduled Task via PowerShell Cmdlets",
+  Severity = "🟠 Medium",
+  PrimaryAccount = tostring(Accounts[0]),
+  Summary = strcat(
+    "⚠️ PowerShell-created scheduled task detected\n",
+    "• Who: ", strcat_array(Accounts, ", "), "\n",
+    "• What: PS cmdlets for scheduled tasks used\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Parent: ", Parent, " (Signed: ", ParentSigned, ")\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Adversaries often rely on PS cmdlets to create tasks that auto-execute payloads."
+  );
+// 7️⃣ IFEO Debugger hijack via reg.exe
+let IFEO_Debugger_Reg =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "reg.exe" and ProcessCommandLine has " add "
+| where ProcessCommandLine matches regex @"(?i)\\Windows NT\\CurrentVersion\\Image File Execution Options\\[^\\]+\\Debugger"
+| summarize 
+    EventCount = count(),
+    Commands = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Accounts = make_set(AccountName),
+    Parent   = tostring(max(InitiatingProcessFileName)),
+    ParentSigned = tostring(max(InitiatingProcessSignatureStatus)),
+    FirstSeen = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| extend
+  Signal = "IFEO Debugger Hijack (reg.exe)",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0]),
+  Summary = strcat(
+    "⚠️ IFEO Debugger hijack via reg.exe\n",
+    "• Who: ", strcat_array(Accounts, ", "), "\n",
+    "• What: Debugger value set under Image File Execution Options\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Parent: ", Parent, " (Signed: ", ParentSigned, ")\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 IFEO Debugger hijack can redirect process launches to attacker-controlled binaries."
+  );
+// 8️⃣ Winlogon Shell/Userinit modification via reg.exe
+let WinlogonShellUserinit_Reg =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "reg.exe" and ProcessCommandLine has " add "
+| where ProcessCommandLine matches regex @"(?i)\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\(Shell|Userinit)"
+| summarize 
+    EventCount = count(),
+    Commands = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Accounts = make_set(AccountName),
+    Parent   = tostring(max(InitiatingProcessFileName)),
+    ParentSigned = tostring(max(InitiatingProcessSignatureStatus)),
+    FirstSeen = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| extend
+  Signal = "Winlogon Shell/Userinit Modified (reg.exe)",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0]),
+  Summary = strcat(
+    "⚠️ Winlogon Shell/Userinit modified via reg.exe\n",
+    "• Who: ", strcat_array(Accounts, ", "), "\n",
+    "• What: Modification under Winlogon Shell/Userinit keys\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Parent: ", Parent, " (Signed: ", ParentSigned, ")\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Altering Winlogon keys enables execution at logon for persistence."
+  );
+// 9️⃣ Persistence via shortcut creation with PowerShell COM (CreateShortcut)
+let PS_CreateShortcut_Startups =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "powershell.exe"
+| where ProcessCommandLine matches regex @"(?i)WScript\.Shell.*CreateShortcut.*\.lnk"
+| summarize 
+    EventCount = count(),
+    Commands = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Accounts = make_set(AccountName),
+    Parent   = tostring(max(InitiatingProcessFileName)),
+    ParentSigned = tostring(max(InitiatingProcessSignatureStatus)),
+    FirstSeen = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| extend
+  Signal = "Startup LNK via PowerShell (COM)",
+  Severity = "🟠 Medium",
+  PrimaryAccount = tostring(Accounts[0]),
+  Summary = strcat(
+    "⚠️ Startup LNK creation via PowerShell COM\n",
+    "• Who: ", strcat_array(Accounts, ", "), "\n",
+    "• What: WScript.Shell CreateShortcut used to persist in Startup\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Parent: ", Parent, " (Signed: ", ParentSigned, ")\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Shortcuts placed in Startup folders ensure payload execution on user logon."
+  );
+// 🔄 Union
+let BaseAlerts =
+    union SuspiciousTaskCreation, SystemRestoreDisabled, SuspiciousServiceCreation, PS_NewOrSetService, WMI_Wmic_Subscription, PS_ScheduledTasksCmdlets,  IFEO_Debugger_Reg, WinlogonShellUserinit_Reg,PS_CreateShortcut_Startups
+    | project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary
+    | extend JoinKey = tolower(PrimaryAccount);
+let IdxIdentity =
+(
+    IdentityInfo
+    | where TimeGenerated > ago(90d)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN, AccountName, AccountDomain
+    | extend KeyCandidates = pack_array(
+        tolower(tostring(AccountUPN)),
+        tolower(tostring(AccountName)),
+        tolower(strcat(tostring(AccountDomain), "\\", tostring(AccountName))),
+        tolower(tostring(MailAddress))
+      )
+    | mv-expand Key = KeyCandidates to typeof(string)
+    | where isnotempty(Key)
+    | summarize UserFullName = any(AccountDisplayName) by Key
+);
+BaseAlerts
+| join kind=leftouter IdxIdentity on $left.JoinKey == $right.Key
+| extend UserFullName = tostring(coalesce(UserFullName, ""))
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, UserFullName, Signal, Severity, Summary
