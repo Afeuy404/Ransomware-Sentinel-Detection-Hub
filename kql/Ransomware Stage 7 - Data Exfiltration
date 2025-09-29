@@ -1,0 +1,461 @@
+// [Ransomware 7] - Potential Data Exfiltration (Unified main query)
+let timeRange = 90d;
+let binSize   = 15m;
+// 1️⃣ Process executions of 7z/WinRAR creating/updating encrypted archives
+let ProcCreateEncrypted =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("7z.exe","7za.exe","7zr.exe","7zg.exe","rar.exe","winrar.exe")
+| extend cmd          = tolower(ProcessCommandLine),
+         ProcTime     = TimeGenerated,
+         Parent       = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where (
+      (FileName in~ ("7z.exe","7za.exe","7zr.exe","7zg.exe")
+       and cmd matches regex @"(?i)\b(7z|7za|7zr|7zg)(?:\.exe)?\b.*\b(a|u)\b"
+       and (cmd matches regex @"(?i)\s-(p|hp)\S*" or cmd matches regex @"(?i)\s-mhe\b"))
+   or
+      (FileName in~ ("rar.exe","winrar.exe")
+       and cmd matches regex @"(?i)\b(win)?rar(?:\.exe)?\b.*\b(a|u)\b"
+       and cmd matches regex @"(?i)\s-(p|hp)\S*"))
+| project DeviceId, DeviceName, ProcTime, AccountName, Parent, ParentSigned, ProcessCommandLine;
+let ArchiveFiles =
+DeviceFileEvents
+| where TimeGenerated > ago(timeRange)
+| where ActionType in ("FileCreated","FileModified","FileRenamed")
+| where FileName matches regex @"(?i)\.(7z|zip|rar)$"
+| summarize
+    FinalSizeBytes = max(tolong(FileSize)),
+    FirstWrite     = min(TimeGenerated)
+  by DeviceId, DeviceName, FileName, FolderPath
+| extend SizeMB     = toreal(coalesce(FinalSizeBytes, 0)) / 1024.0 / 1024.0
+| extend SizePretty = iff(SizeMB >= 1,
+                         strcat(tostring(round(SizeMB,1)), " MB"),
+                         strcat(tostring(round(SizeMB*1024,0)), " KB"));
+let ArchivePWCreate_FileCorrelated =
+ProcCreateEncrypted
+| join kind=innerunique (ArchiveFiles) on DeviceId
+| where abs(datetime_diff("minute", ProcTime, FirstWrite)) <= 10
+| summarize
+    FirstSeen  = min(ProcTime),
+    Files      = make_set(strcat(FileName, " (", SizePretty, ")"), 10),
+    CountFiles = dcount(FileName),
+    TotalMB    = round(sum(SizeMB), 1),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents    = make_set(Parent, 5),
+    Sigs       = make_set(ParentSigned),
+    Accounts   = make_set(AccountName)
+  by DeviceId, DeviceName
+| extend TimeWindow = bin(FirstSeen, binSize)
+| where CountFiles >= 3 or TotalMB >= 100
+| extend
+  Signal = "Archive creation with password/encryption (correlated)",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    "🚨 Encrypted archive creation correlated with file writes (±10m)\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(Sigs, ", "), ")\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Files: ", strcat_array(Files, " | "), " | Total: ", tostring(TotalMB), " MB\n",
+    "• First time seen: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),"\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Compression + encryption + volume are strong indicators of staging before exfiltration."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 2️⃣ ️Cloud CLI Exfiltration(per-CLI patterns)
+let ExfilDomains = dynamic([
+  "mega.nz","api.mega.co.nz","wetransfer.com","transfer.sh","anonfiles.com","gofile.io","file.io",
+  "dropbox.com","dropboxapi.com","drive.google.com","storage.googleapis.com","box.com","boxcloud.com",
+  "onedrive.live.com","1drv.ms","sharefile.com","files.com","mediafire.com","sendspace.com","pcloud.com",
+  "blob.core.windows.net","storage.cloud.google.com","s3.amazonaws.com"]);
+let CloudCLIs = dynamic([
+  "rclone.exe","megacmd.exe","azcopy.exe","aws.exe","aws.cmd","gsutil.exe",
+  "dbxcli.exe","gdrive.exe","b2.exe","mc.exe","wget.exe","curl.exe","aws_completer.exe"]);
+let InternalMcAliases = dynamic(["dev","uat","prd","prdr","prdw","devr","devw","uatrw"]);
+let CloudCLI_Exfil =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| extend fn  = tolower(FileName),
+         cmd = tolower(ProcessCommandLine)
+| extend Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned"),
+         host = extract(@"(?i)https?://([^/\s]+)", 1, cmd)
+| where fn in~ (CloudCLIs) or cmd has_any (dynamic(["rclone","gsutil","azcopy","aws s3","megacmd"," mc ","dbxcli","gdrive"," b2 "]))
+| where
+  (fn =~ "curl.exe" and
+    ((cmd has_any (dynamic([" --form "," --upload-file "," -t "," -f datafile="," -f datafile=@ "]))
+      or cmd matches regex @"(?i)\b(--request|-x)\s+(post|put)\b"
+      or (cmd has " -d " and cmd !has " -g "))
+     and (host has_any (ExfilDomains))))
+  or (cmd matches regex @"(?i)\baws(\.exe)?\s+s3\s+(sync|cp)\s+(""?[a-z]:\\|\\\\).*\bs3://")
+  or (cmd matches regex @"(?i)\bazcopy(\.exe)?\s+copy\s+(""?[a-z]:\\|\\\\).*\s+https?://"
+      and (host has_any (ExfilDomains) or (isnotempty(host))))
+  or (cmd matches regex @"(?i)\brclone\b.*\b(copy|sync|move|copyto|moveto)\b\s+(""?[a-z]:\\|\\\\).*\s+([a-z0-9_\-]+:|https?://)")
+  or (cmd matches regex @"(?i)\bgsutil(\.exe)?\s+(cp|rsync)\s+(""?[a-z]:\\|\\\\).*\s+gs://")
+  or (cmd matches regex @"(?i)\b(dbxcli|gdrive|b2)\b.*\b(upload|put|sync|cp|move|mirror)\b.*")
+  or (fn =~ "wget.exe" and (cmd matches regex @"(?i)\b(--method)\s+(post|put)\b" or cmd has_any (dynamic([" --post-file="," --body-file="])))
+      and (host has_any (ExfilDomains) or (isnotempty(host))))
+  or (fn =~ "megacmd.exe" and cmd matches regex @"(?i)\b(put|sync)\b\s+(""?[a-z]:\\|\\\\)")
+  or (fn =~ "mc.exe"
+      and cmd matches regex @"(?i)\bmc(\.exe)?\s+(cp|mirror)\s+(""?[a-z]:\\|\\\\)[^\s""]+\s+([^\s""]+)"
+      and not(extract(@"^([^/\\:]+)/", 1, cmd) in~ (InternalMcAliases)))
+| where cmd !has " ls "
+| summarize
+    EventCount = count(),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents    = make_set(Parent, 5),
+    Sigs       = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| extend
+  Signal = "Cloud CLI likely exfil (rclone/azcopy/aws/gsutil/curl/mc/…) — high-signal",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0])
+| extend Summary = strcat(
+     "🚨 High-confidence cloud offload pattern\n",
+     "• Who: ", PrimaryAccount, "\n",
+     "• Parent(s): ", strcat_array(Parents," | "), " (Signature: ", strcat_array(Sigs,", "),")\n",
+     "• Commands: ", strcat_array(Commands," | "), "\n",
+     "• First: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"), "\n",
+     "• Device: ", DeviceId, " (", DeviceName, ")\n",
+     "🛑 Matches per-CLI upload semantics from local to cloud/public endpoints."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 3️⃣ HTTP Upload via PowerShell / curl
+let PS_Curl_Uploads =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("powershell.exe","pwsh.exe","curl.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         Parent=tostring(InitiatingProcessFileName),
+         ParentSigned=iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned")
+| where
+    (FileName in~ ("powershell.exe","pwsh.exe") and (
+        (cmd has "invoke-webrequest" or cmd has "invoke-restmethod") and
+        (cmd matches regex @"(?i)\b-method\s+(post|put)\b" or cmd has "-infile" or cmd has "uploadfile(")
+     ))
+  or (FileName =~ "curl.exe" and (cmd has " --upload-file " or cmd has " -t " or cmd matches regex @"(?i)\b(-f|--form)\b.*@"))
+| summarize
+    EventCount=count(),
+    Commands=make_set(strcat("[",ProcessCommandLine,"]"),5),
+    Parents=make_set(Parent,5),
+    Sigs=make_set(ParentSigned),
+    Accounts=make_set(AccountName),
+    FirstSeen=min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow=bin(TimeGenerated, binSize)
+| where EventCount > 0
+| extend Signal="HTTP Upload via PowerShell/curl",
+         Severity="🔴 High",
+         PrimaryAccount=tostring(Accounts[0])
+| extend Summary=strcat(
+           "🚨 HTTP upload (PUT/POST/InFile)\n",
+           "• Who: ", PrimaryAccount, "\n",
+           "• Parent(s): ", strcat_array(Parents," | "), " (Signature: ", strcat_array(Sigs,", "),")\n",
+           "• Commands: ", strcat_array(Commands," | "), "\n",
+           "• First: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"), "\n",
+           "• Device: ", DeviceId, " (", DeviceName, ")\n",
+           "🛑 Direct file uploads over HTTP/S are a common exfil path."
+         )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 4️⃣ ️SFTP/SCP/FTP clients correlated with public outbound (±5m)
+let SshFtpTools = dynamic(["winscp.exe","winscp.com","filezilla.exe","pscp.exe","psftp.exe","scp.exe","sftp.exe","ssh.exe","plink.exe"]);
+let OutboundSSH_FTP =
+DeviceNetworkEvents
+| where TimeGenerated > ago(timeRange)
+| where ActionType =~ "ConnectionSuccess"
+| where RemotePort in (22,21,990)
+| extend IsPublic = iff(RemoteIPType =~ "Public",true, iff(isnotempty(RemoteIP), not(ipv4_is_private(RemoteIP)), false))
+| where IsPublic
+| project DeviceId, DeviceName,
+          NetTime = TimeGenerated,
+          RemoteIP, RemotePort, RemoteUrl,
+          NetParent = tostring(InitiatingProcessFileName),
+          NetAccount = coalesce(InitiatingProcessAccountName, InitiatingProcessAccountUpn);
+let SftpScpClients =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ (SshFtpTools)
+| extend ProcTime = TimeGenerated,
+         Parent   = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where
+  (
+    (tolower(FileName) in ("winscp.com","winscp.exe") and tolower(ProcessCommandLine) matches regex @"(?i)\b(put|mput|synchronize\s+remote)\b")
+    or (tolower(FileName) in ("scp.exe","pscp.exe") and tolower(ProcessCommandLine) matches regex @"(?i)\bscp\b.*\s\S+\s+\S+@[^:\s]+:")
+    or (tolower(FileName) in ("sftp.exe","psftp.exe") and tolower(ProcessCommandLine) matches regex @"(?i)\b-put\b|\b-mput\b")
+  )
+  and (Parent in~ ("cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","python.exe") or ParentSigned !~ "Signed")
+| project DeviceId, DeviceName, ProcTime,
+          Tool = tolower(FileName), ProcessCommandLine, AccountName, Parent, ParentSigned;
+let SFTP_SCP_FTP_Public =
+SftpScpClients
+| join kind=innerunique (OutboundSSH_FTP) on DeviceId
+| where abs(datetime_diff("minute", ProcTime, NetTime)) <= 5
+| summarize
+    EventCount = count(),
+    Clients    = make_set(Tool, 5),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents    = make_set(Parent, 5),
+    Sigs       = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    Dsts       = make_set(strcat(RemoteIP, ":", tostring(RemotePort),
+                                 iff(isnotempty(RemoteUrl), strcat(" (", RemoteUrl, ")"), "")), 10),
+    FirstProc  = min(ProcTime),
+    FirstNet   = min(NetTime)
+  by DeviceId, DeviceName
+| extend FirstSeen = coalesce(FirstProc, FirstNet)
+| extend TimeWindow = bin(FirstSeen, binSize)
+| where EventCount > 0
+| extend Signal = "SFTP/SCP/FTP to public IP",
+         Severity = "🟠 Medium",
+         PrimaryAccount = tostring(Accounts[0])
+| extend Summary = strcat(
+           "🚨 SFTP/SCP/FTP client activity to public endpoints\n",
+           "• Who: ", PrimaryAccount, "\n",
+           "• Clients: ", strcat_array(Clients, ", "), " | Dests: ", strcat_array(Dsts, ", "), "\n",
+           "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(Sigs, ", "), ")\n",
+           "• Commands: ", strcat_array(Commands, " | "), "\n",
+           "• First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),"\n",
+           "• Device: ", DeviceId, " (", DeviceName, ")\n",
+           "🛑 Interactive file-transfer clients to public endpoints are high-risk for data loss."
+         )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 5️⃣ BITS upload jobs (stealthy HTTP exfil)
+let BitsUpload =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("bitsadmin.exe","powershell.exe","pwsh.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         Parent=tostring(InitiatingProcessFileName),
+         ParentSigned=iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned")
+| where
+    (FileName =~ "bitsadmin.exe" and cmd matches regex @"(?i)\bbitsadmin(\.exe)?\b.*\b/transfer\b.*\b/upload\b")
+  or (FileName in~ ("powershell.exe","pwsh.exe") and cmd matches regex @"(?i)\bstart-bitstransfer\b.*\btransfertype\s*:\s*upload\b")
+| summarize
+    EventCount=count(),
+    Commands=make_set(strcat("[",ProcessCommandLine,"]"),5),
+    Parents=make_set(Parent,5),
+    Sigs=make_set(ParentSigned),
+    Accounts=make_set(AccountName),
+    FirstSeen=min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow=bin(TimeGenerated, binSize)
+| where EventCount > 0
+| extend Signal="BITS upload job created",
+         Severity="🔴 High",
+         PrimaryAccount=tostring(Accounts[0])
+| extend Summary=strcat(
+           "🚨 BITS upload job (stealthy HTTP exfil)\n",
+           "• Who: ", PrimaryAccount, "\n",
+           "• Parent(s): ", strcat_array(Parents," | "), " (Signature: ", strcat_array(Sigs,", "), ")\n",
+           "• Commands: ", strcat_array(Commands," | "), "\n",
+           "• First time seen: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"),
+           "• Device: ", DeviceId, " (", DeviceName, ")\n",
+           "🛑 BITS upload jobs enable stealthy, throttled exfiltration that survives reboots."
+         )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 6️⃣ Browser bursts vers domaines de partage de fichiers
+let Browsers = dynamic(["chrome.exe","msedge.exe","firefox.exe","iexplore.exe"]);
+let Browser_ExfilDomains = dynamic([
+  "mega.nz","meganz.cmd","api.mega.co.nz","wetransfer.com","transfer.sh","anonfiles.com","gofile.io","file.io",
+  "dropbox.com","dropboxapi.com","drive.google.com","storage.googleapis.com","box.com","boxcloud.com",
+  "onedrive.live.com","1drv.ms","sharefile.com","files.com","mediafire.com","sendspace.com","pcloud.com"
+]);
+let BrowserToFileShareDomains =
+DeviceNetworkEvents
+| where TimeGenerated > ago(timeRange)
+| where InitiatingProcessFileName in~ (Browsers)
+| extend host = tolower(parse_url(RemoteUrl).Host)
+| where host has_any (Browser_ExfilDomains)
+| summarize
+    Hits=count(),
+    Hosts=make_set(host, 5),
+    Procs=make_set(InitiatingProcessFileName, 5),
+    Accounts=make_set(InitiatingProcessAccountName),
+    FirstSeen=min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow=bin(TimeGenerated, 10m)
+| where Hits >= 5
+| extend Signal="Browser activity to file-sharing domains (burst)",
+         Severity="🟠 Medium",
+         PrimaryAccount=tostring(Accounts[0])
+| extend Summary=strcat(
+           "⚠️ Browser connections to file-sharing domains (burst)\n",
+           "• Who: ", PrimaryAccount, "\n",
+           "• Domains: ", strcat_array(Hosts, ", "), " | Hits(10m): ", tostring(Hits), "\n",
+           "• Process: ", strcat_array(Procs, ", "), "\n",
+           "• First time seen: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"),"\n",
+           "• Device: ", DeviceId, " (", DeviceName, ")\n",
+           "🛑 Burst connections to consumer file-sharing sites often precede bulk uploads."
+         )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 7️⃣ CLI-based SMTP email exfil
+let SMTP_CLI_Exfil =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("powershell.exe","pwsh.exe","curl.exe", "blat.exe","blat64.exe","sendemail.exe","mailsend.exe","smtp-cli.exe","swaks.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         Parent=tostring(InitiatingProcessFileName),
+         ParentSigned=iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned")
+| where
+  (FileName in~ ("powershell.exe","pwsh.exe") and ((cmd matches regex @"(?i)\bsend-mailmessage\b" and cmd has "-attachments")
+    or (cmd matches regex @"(?i)\b(new-object\s+net\.mail\.smtpclient|system\.net\.mail\.smtpclient)\b"
+    and cmd matches regex @"(?i)\b(attachment|attachments|addattachment\(|\.attachments\.add\()")))
+  or (FileName =~ "curl.exe"and cmd matches regex @"(?i)\bsmtp(?:s)?://" and cmd has_any ("--mail-from","--mail-rcpt") and cmd has_any ("--upload-file","-T"))
+  or (tolower(FileName) in ("blat.exe","blat64.exe") and cmd has "-to" and (cmd has "-att" or cmd has "-attach" or cmd matches regex @"(?i)\b-a\s+\S+"))
+  or (FileName =~ "sendemail.exe" and cmd has "-to" and (cmd matches regex @"(?i)\b-attach\b" or cmd has " -a "))
+  or (FileName =~ "mailsend.exe"and cmd has "-smtp" and cmd has "-to" and (cmd has "-attach" or cmd has "-file" or cmd has "-stdin"))
+  or (FileName =~ "smtp-cli.exe" and cmd has "--server" and cmd has "--to" and (cmd has "--attach" or cmd has "--data" or cmd matches regex @"(?i)\b--.*file\b"))
+  or (FileName =~ "swaks.exe" and cmd has "--server" and cmd has "--to" and (cmd has "--attach" or cmd has "--data" or cmd has "--body"))
+| summarize
+    EventCount=count(),
+    Commands=make_set(strcat("[",ProcessCommandLine,"]"),5),
+    Parents=make_set(Parent,5),
+    Sigs=make_set(ParentSigned),
+    Accounts=make_set(AccountName),
+    FirstSeen=min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow=bin(TimeGenerated, binSize)
+| where EventCount > 0
+| extend Signal="CLI-based SMTP email exfil",
+         Severity="🟠 Medium",
+         PrimaryAccount=tostring(Accounts[0])
+| extend   Summary=strcat(
+           "⚠️ Email exfil via CLI SMTP utilities\n",
+           "• Who: ", PrimaryAccount, "\n",
+           "• Parent(s): ", strcat_array(Parents," | "), " (Signature: ", strcat_array(Sigs,", "), ")\n",
+           "• Commands: ", strcat_array(Commands," | "), "\n",
+           "• First time seen: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"),
+           "• Device: ", DeviceId, " (", DeviceName, ")\n",
+           "🛑 Command-line email tools with attachments can exfiltrate data outside DLP routes."
+         )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 8️⃣ Mass Cloud Download Activity (SharePoint / OneDrive)
+let MassCloudDownload =
+CloudAppEvents
+| where TimeGenerated > ago(timeRange)
+| where Application in~ ("Office 365 SharePoint Online","Microsoft OneDrive for Business")
+| where ActionType in~ ("FileDownloaded")
+| where not(UserAgent has_any ("OneDrive","SkyDrive","Microsoft Office","MSOffice","Excel","Word","PowerPoint","Upload Center","Office16"))
+| extend AF = parse_json(AdditionalFields)
+| extend ObjSize = tolong(AF.ObjectSize),
+         ObjExt  = tolower(extract(@"\.([a-z0-9]{1,5})$", 1, tostring(ObjectName)))
+| where isempty(ObjExt) or ObjExt in~ ("zip","7z","rar","pst","bak","sqlite","mdb","csv","xlsx","xls","doc","docx","ppt","pptx","pdf")
+| summarize
+    DownloadCount   = count(),
+    DistinctFiles   = dcount(ObjectName),
+    DistinctUAs     = dcount(UserAgent),
+    TotalBytes      = sum(coalesce(ObjSize, 0)),
+    SampleFiles     = make_set(ObjectName, 5),
+    UserAgents      = make_set(UserAgent, 3),
+    FirstSeen       = min(TimeGenerated)
+  by AccountDisplayName, TimeWindow = bin(TimeGenerated, binSize)
+| where (DownloadCount >= 100 and (DistinctFiles >= 100 or DistinctUAs >= 1))
+| extend
+    DeviceId = "N/A",
+    DeviceName = "N/A",
+    Signal = "Mass Download via SharePoint/OneDrive",
+    Severity = "🟡 Low",
+    PrimaryAccount = AccountDisplayName,
+    Summary = strcat(
+      "⚠️ High-volume cloud downloads detected (SPO/OneDrive)\n",
+      "• Who: ", AccountDisplayName, "\n",
+      "• Count: ", tostring(DownloadCount),
+      " | Distinct files: ", tostring(DistinctFiles),
+      " | Distinct UAs: ", tostring(DistinctUAs), "\n",
+      "• UserAgents: ", strcat_array(UserAgents, " | "), "\n",
+      "• Files (sample): ", strcat_array(SampleFiles, " | "), "\n",
+      "• First time seen: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+      "🛑 Unusual spikes in SPO/OneDrive downloads may indicate staging or exfiltration."
+    )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 9️⃣ USB Exfiltration Suspected (post-mount writes) + USB device details
+let corrWindow  = 2h;
+let minFileSize = 1048576; // 1 MB
+let IsSensitiveExt = (path:string) {
+  tolower(path) matches regex @"\.(docx?|xlsx?|pptx?|pdf|csv|txt|rtf|zip|7z|rar|pst|ost|bak|db|sqlite|mdb|accdb|sql|pem|ppk|pfx|key|crt|conf|json|yml|yaml)$"
+};
+let UsbMounts =
+DeviceEvents
+| where TimeGenerated > ago(timeRange)
+| where ActionType == "UsbDriveMounted"
+| extend af = parse_json(AdditionalFields)
+| extend DriveLetter    = tostring(af.DriveLetter)
+      , BusType        = tostring(af.BusType)
+      , Manufacturer   = tostring(af.Manufacturer)
+      , ProductName    = tostring(af.ProductName)
+      , ProductRevision= tostring(af.ProductRevision)
+      , Volume         = tostring(af.Volume)
+      , LoggedOnUsers  = tostring(array_strcat(af.LoggedOnUsers, ","))
+| extend DeviceInfo = trim(" ", strcat(iff(isempty(Manufacturer), "", strcat(Manufacturer, " ")), iff(isempty(ProductName), "", strcat(ProductName, " ")), ProductRevision))
+| project DeviceId, DeviceName, TimeMounted=TimeGenerated, DriveLetter, Volume, BusType, Manufacturer, ProductName, ProductRevision, DeviceInfo,
+          AccountName = coalesce(InitiatingProcessAccountUpn, strcat(InitiatingProcessAccountName, "@", InitiatingProcessAccountDomain), LoggedOnUsers);
+let UsbFileWrites =
+DeviceFileEvents
+| where TimeGenerated > ago(timeRange)
+| where ActionType in~ ("FileCreated")
+| where FileSize >= minFileSize
+| where IsSensitiveExt(FolderPath) or IsSensitiveExt(FileName)
+| extend DriveLetter = toupper(substring(FolderPath, 0, 2))
+| project DeviceId, DeviceName, TimeGenerated, DriveLetter, FileName, FolderPath, FileSize,
+          Upn = coalesce(InitiatingProcessAccountUpn, strcat(InitiatingProcessAccountName, "@", InitiatingProcessAccountDomain));
+let USB_Exfil =
+UsbMounts
+| join kind=innerunique UsbFileWrites on DeviceId
+| where isnotempty(DriveLetter) and FolderPath startswith strcat(DriveLetter, "\\")
+| where TimeGenerated between (TimeMounted .. (TimeMounted + corrWindow))
+| summarize
+    FilesWritten = count(),
+    TotalBytes   = sum(FileSize),
+    SampleFiles  = make_set(strcat(FolderPath, "\\", FileName), 4),
+    Users        = make_set(coalesce(Upn, AccountName), 5),
+    DriveLetters = make_set(DriveLetter, 5),
+    Volumes      = make_set(Volume, 3),
+    BusTypes     = make_set(BusType, 3),
+    Devices      = make_set(DeviceInfo, 3),
+    FirstSeen    = min(TimeGenerated),
+    LastSeen     = max(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeMounted, binSize)
+| where FilesWritten >= 10 or TotalBytes >= 209715200
+| extend
+  Signal = "USB Exfiltration Suspected (post-mount writes)",
+  Severity = iff(TotalBytes >= 1073741824 or FilesWritten >= 200, "🔴 High", "🟠 Medium"),
+  PrimaryAccount = tostring(Users[0]),
+  Summary = strcat(
+    "🚨 USB activity after mount: bulk sensitive file writes", "\n",
+    "• Who: ", strcat_array(Users, ", "), "\n",
+    "• Drive(s): ", strcat_array(DriveLetters, ", "),
+      " | Files: ", tostring(FilesWritten),
+      " | Size: ", format_bytes(TotalBytes), "\n",
+    "• Device details: ", iff(array_length(Devices)>0, strcat_array(Devices, " | "), "n/a"),
+      " | BusType(s): ", iff(array_length(BusTypes)>0, strcat_array(BusTypes, ", "), "n/a"),
+      " | Volume(s): ", iff(array_length(Volumes)>0, strcat_array(Volumes, " | "), "n/a"), "\n",
+    "• Sample: ", strcat_array(SampleFiles, " | "), "\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+      " → ", format_datetime(LastSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")", "\n",
+    "🛑 High-volume writes to removable media shortly after mount strongly suggest data exfiltration."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 🔄 Union
+let BaseAlerts =
+    union   ArchivePWCreate_FileCorrelated,CloudCLI_Exfil,PS_Curl_Uploads,SFTP_SCP_FTP_Public,BitsUpload,BrowserToFileShareDomains,SMTP_CLI_Exfil,MassCloudDownload,USB_Exfil
+    | extend JoinKey = tolower(PrimaryAccount);
+let IdxIdentity =
+(
+    IdentityInfo
+    | where TimeGenerated > ago(90d)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN, AccountName, AccountDomain
+    | extend KeyCandidates = pack_array(
+        tolower(tostring(AccountUPN)),
+        tolower(tostring(AccountName)),
+        tolower(strcat(tostring(AccountDomain), "\\", tostring(AccountName))),
+        tolower(tostring(MailAddress))
+      )
+    | mv-expand Key = KeyCandidates to typeof(string)
+    | where isnotempty(Key)
+    | summarize UserFullName = any(AccountDisplayName) by Key
+);
+BaseAlerts
+| join kind=leftouter IdxIdentity on $left.JoinKey == $right.Key
+| extend UserFullName = tostring(coalesce(UserFullName, ""))
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, UserFullName, Signal, Severity, Summary
