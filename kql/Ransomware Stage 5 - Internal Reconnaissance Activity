@@ -1,0 +1,427 @@
+// [Ransomware - Stage 5] Internal Reconnaissance Activity
+let timeRange  = 90d;
+let timeWindow = 30m;
+let binSize    = 15m;
+// 1️⃣ Host + Network Recon (Correlated)
+let CorpSuffixes = dynamic(["mercuria.met", ".mercuria.net"]);
+let IsLoopback = (s:string) { tolower(s) in~ ("127.0.0.1","localhost","::1") };
+let IsIPv4     = (s:string) { s matches regex @"^\d{1,3}(\.\d{1,3}){3}$" };
+let IsRFC1918  = (s:string) { s matches regex @"^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)" };
+let HasCorpSuffix = (s:string) { array_length(CorpSuffixes) > 0
+                                 and (tolower(s) endswith tostring(CorpSuffixes[0]) or tolower(s) endswith tostring(CorpSuffixes[1])) };
+// --- Local host enumeration (real binaries) ---
+let LocalEnum =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("whoami.exe","hostname.exe","systeminfo.exe","ipconfig.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         Parent=tostring(InitiatingProcessFileName),
+         ParentSigned=iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where FileName !~ "ipconfig.exe" or cmd has "/all"
+| summarize LocalCount = count(),
+            HostCommands = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+            HostParents  = make_set(Parent, 5),
+            HostSigs     = make_set(ParentSigned),
+            FirstLocal = min(TimeGenerated)
+  by DeviceId, DeviceName, AccountName;
+// --- Network recon (real tools) + target extraction & categorization ---
+let NetworkRecon =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("ping.exe","arp.exe","nbtstat.exe","net.exe","tracert.exe","nslookup.exe", "nltest.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         tool = case(
+           FileName =~ "ping.exe",    "ping",
+           FileName =~ "arp.exe",     "arp",
+           FileName =~ "nbtstat.exe", "nbtstat",
+           FileName =~ "net.exe",     "net",
+           FileName =~ "tracert.exe", "tracert",
+           FileName =~ "nltest.exe",  "nltest",
+           FileName =~ "nslookup.exe","nslookup","other"),
+         Parent=tostring(InitiatingProcessFileName),
+         ParentSigned=iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned")
+// extract target where applicable
+| extend Target = case(
+    tool == "ping",     tolower(extract(@"(?i)\bping(?:\.exe)?\s+(?:-\S+\s+)*([^\s]+)", 1, cmd)),
+    tool == "nbtstat",  tolower(extract(@"(?i)\bnbtstat(?:\.exe)?\s+(?:-\S+\s+)*([^\s]+)", 1, cmd)),
+    tool == "net" and cmd matches regex @"\bnet(\.exe)?\s+view\s+\\\\", tolower(extract(@"(?i)\bnet(?:\.exe)?\s+view\s+\\\\([^\s]+)", 1, cmd)),
+    tool == "arp",      tolower(extract(@"(?i)\barp(?:\.exe)?\s+-a(?:\s+([0-9\.]+))?", 1, cmd)),
+    tool == "tracert",  tolower(extract(@"(?i)\btracert(?:\.exe)?\s+(?:-\S+\s+)*([^\s]+)", 1, cmd)),
+    tool == "nslookup", tolower(extract(@"(?i)\bnslookup(?:\.exe)?\s+(?:-\S+\s+)*([^\s]+)", 1, cmd)),
+    tool == "nltest",  tolower(extract(@"(?i)\bnltest(?:\.exe)?\s+/(?:dclist|dsgetdc):([^\s]+)", 1, cmd)),
+    "")
+// benign ping noise
+| where not(tool == "ping" and (cmd matches regex @"(?i)\b(127\.0\.0\.1|::1|localhost|8\.8\.8\.8|google\.com)\b"))
+| where not(tool == "ping" and (cmd has "http://" or cmd has "https://"))
+// classify target
+| extend cat = case(
+    IsRFC1918(Target) or HasCorpSuffix(Target) or (isnotempty(Target) and Target !contains "." and not(IsIPv4(Target))), "internal",
+    IsIPv4(Target) or (isnotempty(Target) and Target contains "."), "external",
+    "unknown")
+| summarize
+    NetCount      = count(),
+    NetCommands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Tools         = make_set(tool, 10),
+    NonPingCount  = sum(iif(tool != "ping", 1, 0)),
+    NetParents    = make_set(Parent, 5),
+    NetSigs       = make_set(ParentSigned),
+    InternalTgts  = make_set_if(Target, cat=="internal" and isnotempty(Target), 10),
+    ExternalTgts  = make_set_if(Target, cat=="external" and isnotempty(Target), 10),
+    FirstNet      = min(TimeGenerated)
+  by DeviceId, DeviceName, AccountName;
+// --- Correlate within timeWindow & apply anti-noise thresholds ---
+let HostAndNetRecon =
+LocalEnum
+| join kind=inner NetworkRecon on DeviceId, DeviceName, AccountName
+| where abs(datetime_diff("minute", FirstLocal, FirstNet)) <= tolong(timeWindow)
+| where NonPingCount >= 2 and array_length(Tools) >= 3
+| summarize
+    LocalCount = sum(LocalCount),
+    NetCount   = sum(NetCount),
+    HostCommands = make_set(HostCommands, 6),
+    NetCommands  = make_set(NetCommands, 6),
+    ToolsUsed    = make_set(Tools, 5),
+    Parents      = array_concat(any(HostParents), any(NetParents)),
+    ParentSigs   = array_concat(any(HostSigs), any(NetSigs)),
+    InternalTgts = any(InternalTgts),
+    ExternalTgts = any(ExternalTgts),
+    FirstSeen    = min(FirstLocal)
+  by DeviceId, DeviceName, AccountName
+| extend Signal = "Combined Host and Network Reconnaissance",
+         PrimaryAccount = AccountName,
+         Severity = iff(strcat_array(ToolsUsed, ",") has_any ("net","nbtstat","nltest"), "🟠 Medium", "🟡 Low"),
+         Summary = strcat(
+           "🔎 Host + network reconnaissance within ", tostring(timeWindow), "\n",
+           "• Who: ", AccountName, "\n",
+           "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSigs, ", "), ")\n",
+           "• Host Commands: ", strcat_array(HostCommands, " | "), "\n",
+           "• Network Commands: ", strcat_array(NetCommands, " | "), "\n",
+           "• Tools: ", strcat_array(ToolsUsed, ", "), "\n",
+           "• Targets | internal: ", iff(array_length(InternalTgts)>0, strcat_array(InternalTgts, ", "), "n/a"),
+           " | external: ", iff(array_length(ExternalTgts)>0, strcat_array(ExternalTgts, ", "), "n/a"), "\n",
+           "• Counts: host=", tostring(LocalCount), ", net=", tostring(NetCount), "\n",
+           "• First time seen: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+           "• Device: ", DeviceId, " (", DeviceName, ")\n",
+           "🛑 Combined discovery in a short window often precedes lateral movement and staging for credential access—validate parent provenance and intended scope."
+         )
+| project TimeWindow = bin(FirstSeen, binSize), DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 2️⃣ AD Enumeration via PowerShell (Get-AD*)
+let ADRecon_PS =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("powershell.exe","pwsh.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where cmd matches regex @"\bget-ad(computer|user|group|domain|forest|organizationalunit|object|trust)\b"
+      and (cmd has "-filter" or cmd has "-ldapfilter" or cmd has "-searchbase" or cmd has "-properties" or cmd has " | select")
+| where not(Parent in~ ("intunemanagementextension.exe","ccmexec.exe","softwarecenter.exe","companyportal.exe"))
+| summarize
+    EventCount = count(),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents    = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount >= 1
+| extend
+  Signal="AD Enumeration via PowerShell (Get-AD*)",
+  Severity="🟠 Medium",
+  PrimaryAccount=tostring(Accounts[0])
+| extend  Summary=strcat(
+    "🔎 AD reconnaissance using Get-AD* cmdlets\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents," | "), " (Signature: ", strcat_array(ParentSigs,", "), ")\n",
+    "• Commands: ", strcat_array(Commands," | "), "\n",
+    "• Events: ", tostring(EventCount), " | First: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Directory mapping may be a precursor to group targeting, delegation abuse, or Kerberoasting."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 3️⃣ AD/DC Discovery via NLTEST
+let NLTESTRecon =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "nltest.exe"
+| extend cmd = tolower(ProcessCommandLine),
+         Parent=tostring(InitiatingProcessFileName),
+         ParentSigned=iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where cmd has_any ("/dclist", "/dclist:", "/domain_trusts", "/dsgetdc:", "/trusted_domains")
+| summarize
+    DistCmds   = dcount(ProcessCommandLine),
+    Commands   = make_set(strcat("[",ProcessCommandLine,"]"),5),
+    Parents    = make_set(Parent,5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where DistCmds >= 1
+| extend
+  Signal="AD/DC Discovery via NLTEST",
+  Severity="🔴 High",
+  PrimaryAccount=tostring(Accounts[0])
+| extend  Summary=strcat(
+    "🔎 Domain/DC/trust discovery using nltest\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents," | "), " (Signature: ", strcat_array(ParentSigs,", "),")\n",
+    "• Commands: ", strcat_array(Commands," | "), "\n",
+    "• Distinct Cmds: ", tostring(DistCmds), " | First: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Enumerating DCs/trusts often signals preparation for cross-domain movement or credential abuse."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 4️⃣ SPN Enumeration via setspn -Q
+let SetSpnRecon =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "setspn.exe"
+| extend cmd = tolower(ProcessCommandLine),
+         Parent=tostring(InitiatingProcessFileName),
+         ParentSigned=iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where cmd matches regex @"(?i)\bsetspn(?:\.exe)?\s+(-f\s+)?-q\b"
+      and (cmd has "*/" or cmd matches regex @"(?i)\b(ldap|http|cifs|host|mssql|wsman|smtp)/")
+| summarize
+    EventCount = count(),
+    Commands   = make_set(strcat("[",ProcessCommandLine,"]"),5),
+    Parents    = make_set(Parent,5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount >= 1
+| extend
+  Signal="SPN Enumeration via setspn -Q",
+  Severity="🔴 High",
+  PrimaryAccount=tostring(Accounts[0])
+| extend Summary=strcat(
+    "🚨 SPN query (Kerberoast reconnaissance)\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents," | "), " (Signature: ", strcat_array(ParentSigs,", "),")\n",
+    "• Commands: ", strcat_array(Commands," | "), "\n",
+    "• When: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 SPN enumeration often precedes ticket requests for Kerberoasting and service account targeting."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 5️⃣ Privileged AD Group Enumeration
+let PrivGroupsEnum =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("net.exe","net1.exe","dsquery.exe","dsget.exe","powershell.exe","pwsh.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         Parent=tostring(InitiatingProcessFileName),
+         ParentSigned=iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where
+    (FileName in~ ("net.exe","net1.exe")
+        and cmd matches regex @"\bnet(\.exe)?\s+group\s+(""|')?(domain admins|enterprise admins|schema admins)(""|')?\s+/domain\b")
+  or (FileName in~ ("dsquery.exe","dsget.exe")
+        and cmd matches regex @"(?i)\b(dsquery|dsget)\s+group\b.*(domain admins|enterprise admins|schema admins)")
+  or (FileName in~ ("powershell.exe","pwsh.exe")
+        and cmd matches regex @"(?i)get-adgroupmember\b.*(domain admins|enterprise admins|schema admins)")
+| summarize
+    EventCount = count(),
+    Commands   = make_set(strcat("[",ProcessCommandLine,"]"),5),
+    Parents    = make_set(Parent,5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount >= 1
+| extend
+  Signal="Privileged AD Group Enumeration",
+  Severity="🟠 Medium",
+  PrimaryAccount=tostring(Accounts[0])
+| extend  Summary=strcat(
+    "🚨 Enumeration of Domain/Enterprise/Schema Admins\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents," | "), " (Signature: ", strcat_array(ParentSigs,", "),")\n",
+    "• Commands: ", strcat_array(Commands," | "), "\n",
+    "• When: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Querying privileged groups is commonly used to identify takeover paths and high-value targets."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 6️⃣ BloodHound / PowerView Collection
+let BloodHound_PowerView =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("sharphound.exe","bloodhound.exe","powershell.exe","pwsh.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         Parent=tostring(InitiatingProcessFileName),
+         ParentSigned=iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where FileName in~ ("sharphound.exe","bloodhound.exe")
+   or (FileName in~ ("powershell.exe","pwsh.exe")
+       and cmd has_any ("invoke-bloodhound","sharphound.ps1","collectionmethod",
+                         "get-netdomain","get-netcomputer","get-netuser","get-netgroup",
+                         "invoke-sharefinder","find-localadminaccess","get-objectacl","get-domaingroupmember"))
+| summarize
+    EventCount = count(),
+    Commands   = make_set(strcat("[",ProcessCommandLine,"]"),5),
+    Parents    = make_set(Parent,5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount >= 1
+| extend
+  Signal="BloodHound/PowerView Collection Activity",
+  Severity="🔴 High",
+  PrimaryAccount=tostring(Accounts[0])
+| extend  Summary=strcat(
+    "🚨 AD reconnaissance tooling detected (BloodHound/PowerView)\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents," | "), " (Signature: ", strcat_array(ParentSigs,", "),")\n",
+    "• Commands: ", strcat_array(Commands," | "), "\n",
+    "• Events: ", tostring(EventCount), " | First: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Graph-based AD collection typically precedes path-finding to privileged assets and ACL abuse."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 7️⃣ SMB Share Enumeration (net view sweep)
+let NetViewSweep =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "net.exe"
+| extend cmd = tolower(ProcessCommandLine),
+         Parent=tostring(InitiatingProcessFileName),
+         ParentSigned=iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where cmd matches regex @"(?i)\bnet(\.exe)?\s+view\s+\\\\[^\s]+"
+| extend TargetHost = tolower(extract(@"(?i)\bnet(?:\.exe)?\s+view\s+\\\\([^ \t/\\]+)",1,cmd))
+| summarize
+    DistHosts  = dcount(TargetHost),
+    Hosts      = make_set(TargetHost, 20),
+    Commands   = make_set(strcat("[",ProcessCommandLine,"]"),5),
+    Parents    = make_set(Parent,5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where DistHosts >= 1
+| extend
+  Signal="SMB Share Enumeration (net view sweep)",
+  Severity="🟠 Medium",
+  PrimaryAccount=tostring(Accounts[0])
+| extend  Summary=strcat(
+    "🔎 Multiple hosts enumerated via 'net view'\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Targets: ", strcat_array(Hosts, ", "), "\n",
+    "• Parent(s): ", strcat_array(Parents," | "), " (Signature: ", strcat_array(ParentSigs,", "),")\n",
+    "• Commands: ", strcat_array(Commands," | "), "\n",
+    "• Distinct hosts: ", tostring(DistHosts), " | First: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Broad SMB enumeration suggests share hunting before data staging or lateral file operations."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 8️⃣ Forensic Artifact Parsers (Amcache/AppCompat) usage
+let ForensicParsers =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| extend cmd = tolower(ProcessCommandLine),
+         Parent       = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == 'Valid','Signed','Unsigned/Unknown')
+// 1) Outils forensics connus (ajuste si besoin)
+| where FileName in~ ('AppCompatCacheParser.exe','AmcacheParser.exe','RECmd.exe','rip.exe','regripper.exe')
+// 2) OU export ciblé de l'Amcache via reg.exe (vrai signal d'accès artefact)
+   or (FileName =~ 'reg.exe'
+       and cmd matches regex @"(?i)\breg(\.exe)?\s+(save|export|copy)\b.*\\windows\\appcompat\\programs\\amcache\.hve")
+| summarize
+    EventCount = count(),
+    Commands   = make_set(strcat('[', ProcessCommandLine, ']'), 5),
+    Parents    = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount >= 1
+| extend
+  Signal = 'Forensic Artifact Parsers Executed (Amcache/AppCompat)',
+  Severity = '🟠 Medium',
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    '🔎 Execution of forensic parsers targeting Amcache/AppCompat', '\n',
+    '• Who: ', PrimaryAccount, '\n',
+    '• Parent(s): ', strcat_array(Parents, ' | '), ' (Signature: ', strcat_array(ParentSigs, ', '), ')', '\n',
+    '• Commands: ', strcat_array(Commands, ' | '), '\n',
+    '• Events: ', tostring(EventCount), ' | First: ', format_datetime(FirstSeen, 'yyyy-MM-dd HH:mm:ss'), '\n',
+    '• Device: ', DeviceId, ' (', DeviceName, ")\n",
+    '🛑 Accessing Amcache/AppCompat artifacts on an endpoint can indicate anti-forensic behavior or threat-hunting by an intruder.'
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 9️⃣ AD/DC Discovery via DNS SRV (nslookup / Resolve-DnsName / dig)
+let DCSrvDnsRecon =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("nslookup.exe","powershell.exe","pwsh.exe","dig.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+// Patterns DNS SRV pour services AD
+| where
+    (FileName =~ "nslookup.exe"
+        and (cmd has_any ("-type=srv","-q=srv","-type=SRV","-q=SRV")
+             and cmd matches regex @"(?i)_(ldap|kerberos|kpasswd|gc)\._(tcp|udp)\."))
+    or ((FileName in~ ("powershell.exe","pwsh.exe"))
+        and cmd matches regex @"(?i)\bresolve-dnsname\b.*\b-type\s+srv\b"
+        and cmd matches regex @"(?i)_(ldap|kerberos|kpasswd|gc)\._(tcp|udp)\.")
+    // dig SRV
+    or (FileName =~ "dig.exe"
+        and cmd matches regex @"(?i)\bSRV\b"
+        and cmd matches regex @"(?i)_(ldap|kerberos|kpasswd|gc)\._(tcp|udp)\.")
+| extend QueryName =
+    coalesce(
+      extract(@"(?i)\bresolve-dnsname\s+([^\s]+)", 1, cmd),
+      extract(@"(?i)\bnslookup(?:\.exe)?\s+(?:-type(?:=|\s+)srv|-q(?:=|\s+)srv)\s+([^\s]+)", 1, cmd),
+      extract(@"(?i)\bdig(?:\.exe)?\s+([^\s]+)\s+SRV", 1, cmd)
+    )
+| summarize
+    EventCount = count(),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents    = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    QueryNames = make_set(QueryName, 10),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount > 0
+| extend
+  Signal = "AD/DC Discovery via DNS SRV Records",
+  Severity = "🟠 Medium",
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    "🔎 DNS SRV lookups for Active Directory services (_ldap/_kerberos/_kpasswd/_gc)\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSigs, ", "), ")\n",
+    "• Query Names: ", iff(array_length(QueryNames)>0, strcat_array(QueryNames, ", "), "n/a"), "\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Events: ", tostring(EventCount), " | First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 These SRV queries map the AD infrastructure without dedicated tools and can precede lateral movements or targeted ticket queries."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 🔄 Union
+let BaseAlerts =
+    union HostAndNetRecon, ADRecon_PS, NLTESTRecon, SetSpnRecon, PrivGroupsEnum, BloodHound_PowerView, NetViewSweep, ForensicParsers,DCSrvDnsRecon
+    | extend JoinKey = tolower(PrimaryAccount);
+let IdxIdentity =
+(
+    IdentityInfo
+    | where TimeGenerated > ago(90d)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN, AccountName, AccountDomain
+    | extend KeyCandidates = pack_array(
+        tolower(tostring(AccountUPN)),
+        tolower(tostring(AccountName)),
+        tolower(strcat(tostring(AccountDomain), "\\", tostring(AccountName))),
+        tolower(tostring(MailAddress))
+      )
+    | mv-expand Key = KeyCandidates to typeof(string)
+    | where isnotempty(Key)
+    | summarize UserFullName = any(AccountDisplayName) by Key
+);
+BaseAlerts
+| join kind=leftouter IdxIdentity on $left.JoinKey == $right.Key
+| extend UserFullName = tostring(coalesce(UserFullName, ""))
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, UserFullName, Signal, Severity, Summary
+
+
+
