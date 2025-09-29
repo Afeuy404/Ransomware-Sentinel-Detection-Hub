@@ -1,0 +1,360 @@
+// [Ransomware 8] - Destructive Behavior (Encryption, Wiping, Recovery Blocking)
+let timeRange = 90d;
+let HV_SensitiveExt = dynamic([
+  "doc","docx","xls","xlsx","ppt","pptx","pdf","txt","csv","rtf",
+  "zip","7z","rar","tar","gz","tgz","7zip",
+  "pst","ost","bak","db","sqlite","mdb","accdb","sql",
+  "json","xml","yml","yaml","cfg","conf","ini",
+  "pem","ppk","pfx","key","crt","cert"]);
+let HV_SuspiciousPathIndicatorsForSystem = dynamic([
+  @"\users\",@"\documents and settings\",@"\users\public\", @"\programdata\", @"\inetpub\wwwroot\",
+  @"\onedrive\", @"\shares\", @"\downloads\", @"\appdata\local\temp\", @"\appdata\local\microsoft\windows\inetcache\",
+  @"\users\default\",@"\temp\",@"\$recycle.bin\",@"c:\\windows\\ccm\\cidownloader\\staging\\"]);
+let ME_SuspRansomExt = dynamic([
+  "locked","encrypted","crypt","crypted","cryp1","cry","enc","krab",
+  "locky","egregor","conti","ryuk","ransom","mallox","leak","pay",
+  "phobos","hive","blackcat","akira","noescape"]);
+let ME_SuspiciousPathIndicatorsForSystem = HV_SuspiciousPathIndicatorsForSystem; // reuse
+let UNC_Exclude1 = @"(?i)\\\\[^\\]+\\sysvol\\";
+let UNC_Exclude2 = @"(?i)\\\\[^\\]+\\netlogon\\";
+let UNC_Exclude3 = @"(?i)\\\\[^\\]+\\print$";
+let UNC_Exclude4 = @"(?i)\\\\[^\\]+\\ipc$";
+let UNC_SuspParents = dynamic(["cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","mshta.exe","rundll32.exe","7z.exe","winrar.exe","explorer.exe"]);
+let WipeUtils = dynamic(["sdelete.exe","shred.exe","wipe.exe","eraser.exe","securewipe.exe","nwipe.exe"]);
+// 1️⃣ High-volume file access (I/O burst)
+let binSize_HV = 5m;
+let HighVolumeFileAccess =
+DeviceFileEvents
+| where TimeGenerated > ago(timeRange)
+| where ActionType in~ ("FileModified","FileRenamed")
+| extend FolderPathLC = tolower(coalesce(FolderPath, "")),
+         FileExt = tolower(extract(@"\.([a-z0-9]{1,6})$", 1, FileName))
+| where FileExt in~ (HV_SensitiveExt)
+| summarize
+    Events = count(),
+    SampleFiles = make_set(strcat(FolderPath,"\\",FileName), 4),
+    TopProcesses = make_set(InitiatingProcessFileName, 6),
+    TopProcessPaths = make_set(InitiatingProcessFolderPath, 3),
+    Accounts = make_set(tolower(coalesce(InitiatingProcessAccountName, "")), 6),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize_HV)
+| where Events >= 400
+| extend
+  Signal = "High-volume file access (I/O burst)",
+  Severity = "🟡 Low",
+  PrimaryAccount = tostring(Accounts[0])
+| extend Summary = strcat(
+    "🚨 High-volume file modification/rename burst detected\n",
+    "• Who: ", strcat_array(Accounts, ", "), "\n",
+    "• Files touched: ", tostring(Events), " (sample: ", strcat_array(SampleFiles, " | "), ")\n",
+    "• Processes observed: ", strcat_array(TopProcesses, ", "), "\n",
+    "• Process folders: ", strcat_array(TopProcessPaths, " | "), "\n",
+    "• Time window: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"),
+       " → ", format_datetime(LastSeen,"yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Such bursts strongly indicate ransomware encryption or destructive wiping activity."
+)
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 2️⃣ ️Mass file encryption detection 
+let binSize_ME = 10m;
+let MassEncryption =
+DeviceFileEvents
+| where TimeGenerated > ago(timeRange)
+| where ActionType in~ ("FileCreated","FileModified","FileRenamed")
+| extend FileNameLC = tolower(FileName),
+         FolderPathLC = tolower(coalesce(FolderPath,"")),
+         Initiator = tolower(coalesce(InitiatingProcessAccountName,""))
+| extend NewExt = tolower(extract(@"\.([a-z0-9]{1,16})$", 1, FileNameLC))
+| where (NewExt in~ (ME_SuspRansomExt))
+    or (FileNameLC matches regex @"(?i)\.id[-=\[][^\\\s\]]+\]?")
+    or (FileNameLC matches regex @"(?i)\.(docx?|xlsx?|pptx?|pdf|txt|csv)\.(locked|encrypted|enc|crypt(ed)?|cry(p1)?)$")
+| where not(FileNameLC endswith ".lnk" )
+| where (InitiatingProcessAccountName !in ("system")) or ((FolderPathLC has_any (ME_SuspiciousPathIndicatorsForSystem)))
+| summarize
+    EncryptedFileCount = count(),
+    DistinctDirs       = dcount(FolderPathLC),
+    SampleEncryptedFiles = make_set(strcat(FolderPath, "\\", FileName), 4),
+    TopProcesses       = make_set(InitiatingProcessFileName, 6),
+    ParentPaths        = make_set(InitiatingProcessFolderPath, 6),
+    Accounts           = make_set(coalesce(InitiatingProcessAccountName, ""), 6),
+    FirstSeen          = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize_ME)
+| where EncryptedFileCount >= 40 or (EncryptedFileCount >= 20 and DistinctDirs >= 10)
+| extend
+  Signal = "Mass File Encryption Detected",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0]),
+  Summary = strcat(
+    "🚨 High-volume file encryption artifacts detected", "\n",
+    "• Who: ", strcat_array(Accounts, ", "), "\n",
+    "• Count: ", tostring(EncryptedFileCount),
+      " | Distinct folders: ", tostring(DistinctDirs), "\n",
+    "• Processes: ", strcat_array(TopProcesses, ", "), "\n",
+    "• Process folders: ", strcat_array(ParentPaths, " | "),"\n",
+    "• Files (sample): ", strcat_array(SampleEncryptedFiles, " | "), "\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Sudden emergence of ransom-style extensions across many files/folders indicates active encryption."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 3️⃣  cipher.exe /w 
+let binSize_Cipher = 10m;
+let CipherDriveWipe =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where tolower(FileName) == "cipher.exe"
+| where tolower(ProcessCommandLine) has "/w"
+| extend
+    ProcTime = TimeGenerated,
+    Initiator = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName, AccountName, ""),
+    Parent = tostring(InitiatingProcessFileName),
+    ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid","Signed","Unsigned/Unknown"),
+    Cmd = ProcessCommandLine
+| summarize
+    WipeCount = count(),
+    WipeCommands = make_set(Cmd, 10),
+    Accounts = make_set(Initiator, 5),
+    Parents = make_set(Parent, 5),
+    ParentSignatures = make_set(ParentSigned, 5),
+    FirstSeen = min(ProcTime)
+  by DeviceId, DeviceName, TimeWindow = bin(ProcTime, binSize_Cipher)
+| where WipeCount > 0
+| extend
+    Signal = "Drive Wipe via cipher.exe",
+    PrimaryAccount = tostring(Accounts[0]),
+    Severity= "🔴 High"
+| extend Summary = strcat(
+        "🚨 Disk wipe attempt using cipher.exe detected\n",
+        "• Who (initiator): ", tostring(PrimaryAccount), "\n",
+        "• Parent process(es): ", strcat_array(Parents, " | "), " (Signed: ", strcat_array(ParentSignatures, ", "), ")\n",
+        "• Commands: ", strcat_array(WipeCommands, " | "), "\n",
+        "• Count: ", tostring(WipeCount), "\n",
+        "• First seen: ", format_datetime(FirstSeen, 'yyyy-MM-dd HH:mm:ss'), "\n",
+        "• Device: ", DeviceId, " (", DeviceName, ")\n",
+        "🛑 cipher.exe /w securely overwrites free space to hinder recovery and is commonly used in destructive post-intrusion cleanup."
+    )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 4️⃣ wbadmin delete 
+let binSize_WB = 10m;
+let WbadminDelete =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where tolower(FileName) == "wbadmin.exe"
+| extend cmd = tolower(ProcessCommandLine),
+         Initiator = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName, AccountName, ""),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid","Signed","Unsigned/Unknown"),
+         ProcFolder = tostring(InitiatingProcessFolderPath)
+| where cmd matches regex @"\bdelete\b\s+(backup|catalog|systemstatebackup|versions?)\b"
+| summarize 
+    DeleteCount = count(), 
+    DeleteCommands = make_set(ProcessCommandLine, 8), 
+    Initiators = make_set(Initiator, 4),
+    Parents = make_set(Parent, 4),
+    ParentSignatures = make_set(ParentSigned, 4),
+    ProcFolders = make_set(ProcFolder, 4),
+    FirstSeen = min(TimeGenerated)
+    by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize_WB)
+| where DeleteCount > 0
+| extend 
+    Signal = "Backup Deletion via wbadmin.exe",
+    PrimaryAccount = tostring(Initiators[0]),
+    Severity = "🔴 High"
+| extend Summary = strcat(
+        "🚨 Attempt to delete backups using wbadmin.exe detected\n",
+        "• Who (initiator): ", tostring(PrimaryAccount), "\n",
+        "• Commands: ", strcat_array(DeleteCommands, " | "), "\n",
+        "• Count: ", tostring(DeleteCount), "\n",
+        "• Parent(s): ", strcat_array(Parents, " | "), " (Signed: ", strcat_array(ParentSignatures, ", "), ")\n",
+        "• Parent process folders: ", strcat_array(ProcFolders, " | "), "\n",
+        "• Device: ", DeviceId, " (", DeviceName, ")\n",
+        "🛑 wbadmin is often used by attackers to remove backup history and prevent recovery. Correlate with VSS/shadow copy deletions and recent privilege escalation events."
+    )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 5️⃣ Boot configuration tampering
+let binSize_Boot = 10m;
+let BootTampering =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where tolower(FileName) in~ ("bootrec.exe","bcdedit.exe","bootcfg.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         Initiator = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName, AccountName, ""),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid","Signed","Unsigned/Unknown"),
+         ProcFolder = tostring(InitiatingProcessFolderPath)
+| where cmd matches regex @"\b(fixboot|fixmbr|rebuildbcd|/rebuildbcd|rebuild\s+bcd)\b"
+   or cmd contains "recoveryenabled no"
+   or cmd contains "bootstatuspolicy ignoreallfailures"
+   or cmd contains "safeboot minimal"
+   or cmd matches regex @"\bbootcfg\s+/(delete|default)\b"
+   or cmd matches regex @"\bbcdedit\b.*\b(/delete|/export|/import|/set)\b"
+| summarize
+    BootCmdCount = count(),
+    BootCommands = make_set(ProcessCommandLine, 10),
+    Initiators = make_set(Initiator, 6),
+    Parents = make_set(Parent, 6),
+    ParentSignatures = make_set(ParentSigned, 6),
+    ProcFolders = make_set(ProcFolder, 6),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize_Boot)
+| where BootCmdCount > 0
+| extend
+    Signal = "Boot Configuration Tampering",
+    PrimaryAccount = tostring(Initiators[0]),
+    Severity = "🔴 High"
+| extend Summary = strcat(
+        "🚨 Boot configuration tampering detected\n",
+        "• Who (initiator): ", tostring(PrimaryAccount), "\n",
+        "• Commands: ", strcat_array(BootCommands, " | "), "\n",
+        "• Count: ", tostring(BootCmdCount), "\n",
+        "• Parent(s): ", strcat_array(Parents, " | "), " (Signed: ", strcat_array(ParentSignatures, ", "), ")\n",
+        "• Parent process folders: ", strcat_array(ProcFolders, " | "), "\n",
+        "• When: ", format_datetime(FirstSeen, 'yyyy-MM-dd HH:mm:ss'), " → ", format_datetime(LastSeen, 'yyyy-MM-dd HH:mm:ss'), "\n",
+        "• Device: ", DeviceId, " (", DeviceName, ")\n",
+        "🛑 Tampering with boot configuration (MBR/BCD/boot options) can render systems unbootable and is frequently used in destructive ransomware or wiper campaigns. Check recent privilege escalations, disk-wipe activity, and Shadow Copy deletions."
+    )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 6️⃣  Destructive wipe utilities executed
+let binSize_WipeUtils = 10m;
+let DestructiveWipeUtils =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| extend fn = tolower(FileName), cmd = tolower(ProcessCommandLine),
+         Initiator = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName, AccountName, ""),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid","Signed","Unsigned/Unknown"),
+         ProcFolder = tostring(InitiatingProcessFolderPath)
+| where fn in~ (WipeUtils)
+| where cmd has_any (" -p "," -n "," -s "," -r "," /p "," /r "," --recursive","--zero","/s ","/p:","/p=") or cmd has_any (" /force"," /all"," /quiet"," -f")
+| summarize
+    WipeCount = count(),
+    Commands = make_set(ProcessCommandLine, 10),
+    Accounts = make_set(Initiator, 5),
+    Parents  = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned, 5),
+    ProcFolders = make_set(ProcFolder, 5),
+    FirstSeen = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize_WipeUtils)
+| where WipeCount > 0
+| extend
+    Signal = "Destructive Wipe Utility Executed (sdelete/shred/wipe/eraser)",
+    Severity = "🔴 High",
+    PrimaryAccount = tostring(Accounts[0])
+| extend Summary = strcat(
+      "🚨 Destructive wipe utility executed\n",
+      "• Who: ", tostring(PrimaryAccount), "\n",
+      "• Tool(s): ", strcat_array(Parents, ", "), "\n",
+      "• Commands: ", strcat_array(Commands, " | "), "\n",
+      "• Count: ", tostring(WipeCount), "\n",
+      "• Parent signatures: ", strcat_array(ParentSigs, ", "), "\n",
+      "• When: ", format_datetime(FirstSeen, 'yyyy-MM-dd HH:mm:ss'), "\n",
+      "• Device: ", DeviceId, " (", DeviceName, ")\n",
+      "🛑 Secure-deletion utilities overwrite data to prevent recovery and are frequently seen in destructive post-encryption activity."
+    )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 7️⃣ BitLocker suspend / protector removal 
+let binSize_BL = 10m;
+let BitLockerSuspension =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| extend cmd = tolower(ProcessCommandLine),
+         fn = tolower(FileName),
+         Initiator = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName, AccountName, ""),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where 
+    (fn == "manage-bde.exe" and (cmd has " -protectors -disable" or cmd has "-protectors -remove" or cmd has " -protectors -removeall" or cmd has " -protectors -adbackup"))
+    or (fn in ("powershell.exe","pwsh.exe") and (cmd has "suspend-bitlocker" or cmd has "remove-bitlockerkeyprotector" or (cmd has "get-bitlockervolume" and cmd has " -protectors ")))
+    or (cmd has "manage-bde -protectors -disable" or cmd has "manage-bde -protectors -remove")
+| summarize
+    CmdCount = count(),
+    Commands = make_set(ProcessCommandLine, 10),
+    Accounts = make_set(Initiator, 5),
+    Parents = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned, 5),
+    FirstSeen = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize_BL)
+| where CmdCount > 0
+| extend
+    Signal = "BitLocker Protection Suspended/Protector Removed",
+    Severity = "🔴 High",
+    PrimaryAccount = tostring(Accounts[0])
+| extend Summary = strcat(
+      "🚨 BitLocker suspend / protector removal observed\n",
+      "• Who: ", PrimaryAccount, "\n",
+      "• Commands: ", strcat_array(Commands, " | "), "\n",
+      "• Count: ", tostring(CmdCount), "\n",
+      "• Parent(s): ", strcat_array(Parents, " | "), " (Signed: ", strcat_array(ParentSigs, ", "), ")\n",
+      "• When: ", format_datetime(FirstSeen, 'yyyy-MM-dd HH:mm:ss'), "\n",
+      "• Device: ", DeviceId, " (", DeviceName, ")\n",
+      "🛑 Suspending BitLocker or removing protectors reduces disk-level protections and may be preparatory to destructive actions or data theft."
+    )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+//8️⃣  Remote share encryption/wiping burst (UNC)
+let binSize_UNC = 5m;
+let RemoteUNCBurst =
+DeviceFileEvents
+| where TimeGenerated > ago(timeRange)
+| where ActionType in~ ("FileCreated","FileModified","FileRenamed","FileDeleted")
+| where FolderPath startswith @"\\"
+| extend lp = tolower(FolderPath), fn = tostring(FileName)
+| where not(lp matches regex UNC_Exclude1 or lp matches regex UNC_Exclude2 or lp matches regex UNC_Exclude3 or lp matches regex UNC_Exclude4)
+| where InitiatingProcessFileName has_any(UNC_SuspParents)
+| where not (FolderPath has_any (@"\Library\", @"\_Python\", @"\_Anaconda_\", @"\site-packages\"))
+| extend UNC_Host = extract(@"^\\\\([^\\]+)\\", 1, lp),
+        UNC_Share= extract(@"^\\\\[^\\]+\\([^\\]+)\\?", 1, lp)
+| summarize
+    IO_Count       = count(),
+    ModCount       = sum(iif(ActionType == "FileModified", 1, 0)),
+    RenCount       = sum(iif(ActionType == "FileRenamed", 1, 0)),
+    DelCount       = sum(iif(ActionType == "FileDeleted", 1, 0)),
+    SampleFiles    = make_set(strcat(FolderPath, "\\", FileName), 6),
+    SampleProcs    = make_set(InitiatingProcessFileName, 6),
+    Accounts       = make_set(InitiatingProcessAccountName, 6),
+    FirstSeen      = min(TimeGenerated)
+  by DeviceId, DeviceName, UNC_Host, UNC_Share, TimeWindow = bin(TimeGenerated, binSize_UNC)
+| where IO_Count >= 1000 or DelCount >= 300 
+| extend
+  Signal = "Remote share I/O burst (UNC) — possible encryption/wipe",
+  Severity = "🟠 Medium",
+  PrimaryAccount = tostring(Accounts[0]),
+  Summary = strcat(
+    "🚨 Massive I/O burst on network share (UNC)\n",
+    "• Who: ", strcat_array(Accounts, ", "), "\n",
+    "• Share: \\\\", UNC_Host, "\\", UNC_Share, "\n",
+    "• Ops (5m): total=", tostring(IO_Count),
+      " | modified=", tostring(ModCount),
+      " | renamed=", tostring(RenCount),
+      " | deleted=", tostring(DelCount),"\n",
+    "• Process(es): ", strcat_array(SampleProcs, " | "), "\n",
+    "• Files (sample): ", strcat_array(SampleFiles, " | "), "\n",
+    "• First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),"\n",
+    "•  Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 High-rate changes on UNC shares are consistent with lateral mass encryption or wiping on file servers."
+  )
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary;
+// 🔄 Union
+let BaseAlerts =
+    union HighVolumeFileAccess,MassEncryption,CipherDriveWipe,WbadminDelete,BootTampering,DestructiveWipeUtils,BitLockerSuspension,RemoteUNCBurst
+    | extend JoinKey = tolower(PrimaryAccount);
+let IdxIdentity =
+(
+    IdentityInfo
+    | where TimeGenerated > ago(90d)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN, AccountName, AccountDomain
+    | extend KeyCandidates = pack_array(
+        tolower(tostring(AccountUPN)),
+        tolower(tostring(AccountName)),
+        tolower(strcat(tostring(AccountDomain), "\\", tostring(AccountName))),
+        tolower(tostring(MailAddress))
+      )
+    | mv-expand Key = KeyCandidates to typeof(string)
+    | where isnotempty(Key)
+    | summarize UserFullName = any(AccountDisplayName) by Key
+);
+BaseAlerts
+| join kind=leftouter IdxIdentity on $left.JoinKey == $right.Key
+| extend UserFullName = tostring(coalesce(UserFullName, ""))
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, UserFullName, Signal, Severity, Summary
