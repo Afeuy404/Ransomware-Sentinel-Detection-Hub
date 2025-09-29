@@ -1,0 +1,429 @@
+// ======================= Parameters =======================
+let lookback = 90d;
+let win = 6h;        // final aggregation window per device/user
+let burst2m = 2m;
+let burst5m = 5m;
+let burst10m = 10m;
+//whitelist for FP filtering
+let wl_schtasks_files = dynamic([
+  @"C:\Program Files\Common Files\Microsoft Shared\ClickToRun\ServiceWatcherSchedule.xml",
+  @"C:\Program Files\Common Files\Microsoft Shared\ClickToRun\FrequentOfficeUpdateSchedule.xml",
+  @"C:\Program Files (x86)\Common Files\Microsoft Shared\OFFICE16\HeartbeatConfig.xml",
+  @"C:\Program Files (x86)\Common Files\Microsoft Shared\OFFICE15\HeartbeatConfig.xml",
+  @"C:\Program Files\Common Files\Microsoft Shared\OFFICE16\HeartbeatConfig.xml",
+  @"C:\Program Files\Common Files\Microsoft Shared\ClickToRun\c2rheartBeatConfig.xml",
+  @"C:\Program Files\Microsoft Office\Office15\1033\officeinventoryagentfallback.xml",
+  @"C:\Program Files\Microsoft Office\Office15\1033\officeinventoryagentlogon.xml",
+  @"C:\Program Files\Npcap\CheckStatus.bat"
+]);
+// ======================= Evidence extractors (DeviceProcessEvents only) =======================
+// 1) VSSADMIN list/delete shadows
+let ev_vssadmin =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "vssadmin.exe" or ProcessCommandLine has "vssadmin"
+| where ProcessCommandLine has_any ("list shadows","delete shadows")
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize Count=count(), Samples=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, Bucket=bin(TimeGenerated, win)
+| extend Evidence="VssAdminShadow";
+// 2) FSUTIL USN deletejournal
+let ev_fsutil =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "fsutil.exe" or ProcessCommandLine has "fsutil"
+| where ProcessCommandLine has "usn" and ProcessCommandLine has "deletejournal"
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize Count=count(), Samples=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, Bucket=bin(TimeGenerated, win)
+| extend Evidence="FsutilUsnDelete";
+// 3) BCDEDIT recovery/bootstatus
+let ev_bcdedit =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "bcdedit.exe" or ProcessCommandLine has "bcdedit"
+| where ProcessCommandLine has_any ("recoveryenabled no","bootstatuspolicy ignoreallfailures")
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize Count=count(), Samples=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, Bucket=bin(TimeGenerated, win)
+| extend Evidence="BcdeditRecovery";
+// 4) WBADMIN delete backup/catalog/systemstatebackup
+let ev_wbadmin =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "wbadmin.exe" or ProcessCommandLine has "wbadmin"
+| where ProcessCommandLine has "delete" and ProcessCommandLine has_any ("backup","catalog","systemstatebackup")
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize Count=count(), Samples=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, Bucket=bin(TimeGenerated, win)
+| extend Evidence="WbadminDelete";
+// 5) WEVTUTIL clear (threshold >2 in 5 min)
+let ev_wevtutil_burst =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where ProcessCommandLine has "wevtutil" and ProcessCommandLine has " cl "
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, t2=bin(TimeGenerated, burst5m)
+| where c > 2
+| summarize Count=sum(c), Samples=make_set(s, 5)
+  by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="WevtutilClearBurst";
+// 6) WMIC shadowcopy delete
+let ev_wmic_shadow =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where ProcessCommandLine has "wmic" and ProcessCommandLine has "shadowcopy" and ProcessCommandLine has "delete"
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize Count=count(), Samples=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, Bucket=bin(TimeGenerated, win)
+| extend Evidence="WmicShadowDelete";
+// 7) SC config <service> start= disabled (≥1)
+let ev_sc_disable =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "sc.exe" or ProcessCommandLine has " sc "
+| where ProcessCommandLine has "config" and ProcessCommandLine has "disabled"
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize Count=count(), Samples=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, Bucket=bin(TimeGenerated, win)
+| extend Evidence="ScConfigDisabled";
+// 8) NET STOP burst (≥3 in 2 min)
+let ev_netstop_burst =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "net.exe" or ProcessCommandLine has " net "
+| where ProcessCommandLine has " stop "
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, t2=bin(TimeGenerated, burst2m)
+| where c >= 3
+| summarize Count=sum(c), Samples=make_set(s, 5)
+  by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="NetStopBurst";
+// 9) TASKKILL burst (≥5 in 2 min)
+let ev_taskkill_burst =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "taskkill.exe" or ProcessCommandLine has "taskkill"
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, t2=bin(TimeGenerated, burst2m)
+| where c >= 4
+| summarize Count=sum(c), Samples=make_set(s, 5)
+  by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="TaskkillBurst";
+// 10) CIPHER /w (≥1)
+let ev_cipher_wipe =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "cipher.exe" or ProcessCommandLine has "cipher"
+| where ProcessCommandLine has "/w"
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize Count=count(), Samples=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, Bucket=bin(TimeGenerated, win)
+| extend Evidence="CipherWipe";
+// 11) SCHTASKS /create — whitelists prudentes + vrais signaux TTP
+let sus_tokens = dynamic([
+  "powershell","pwsh","-enc","-encodedcommand","-nop","-noninteractive",
+  "-windowstyle hidden","-w hidden","-ep bypass","-executionpolicy bypass",  "wscript.exe","cscript.exe","mshta.exe","rundll32","regsvr32",
+  "msbuild","installutil","regsvcs","regasm",  "bitsadmin","certutil","curl","wget","ftp.exe","tftp",  "http://","https://","ftp://","\\\\"
+]);
+let script_ext_regex = @"(?i)\.(ps1|psm1|psd1|ps1xml|bat|cmd|vbs|vbe|js|jse|wsf|wsh|hta|chm)\b";
+let user_writable_paths = dynamic([  "\\appdata\\local\\temp\\","\\appdata\\locallow\\","\\appdata\\roaming\\", "\\users\\public\\","\\programdata\\","\\temp\\","\\downloads\\","\\onedrive\\","\\desktop\\","\\startup\\","\\appdata\\local\\microsoft\\windows\\inetcache\\","\\appdata\\local\\microsoft\\windows\\temporary internet files\\","\\$recycle.bin\\"]);
+let sensitive_triggers = dynamic(["/ru system","/rl highest","/sc onlogon","/sc onstart","/sc onidle", "/sc minute","/mo 1","/mo 5"]);
+let ev_schtasks_create =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName =~ "schtasks.exe" or FileName =~ "schtasks.com" or ProcessCommandLine has "schtasks"
+| where ProcessCommandLine has "/create"
+| project-keep TimeGenerated, DeviceId, AccountName, InitiatingProcessAccountName,
+               FileName, ProcessCommandLine, InitiatingProcessFileName,
+               InitiatingProcessVersionInfoCompanyName, InitiatingProcessSignatureStatus
+// Normalisation & extraction
+| extend cmd = tolower(ProcessCommandLine)
+| extend tn  = tolower(extract(@"(?i)/tn\s+""?([^""]+)""?", 1, cmd))
+| extend xml = tolower(extract(@"(?i)/xml\s+""?([^""]+)""?", 1, cmd))
+| extend tr  = tolower(extract(@"(?i)/tr\s+""?([^""]+)""?", 1, cmd))
+// Signaux à conserver (TTP forts + cas discrets utiles)
+| extend is_msi_remote = cmd matches regex @"(?i)\bmsiexec(\.exe)?\b.*\b(/i|/package)\b.*(https?://|\\\\)"
+| extend mo = toint(extract(@"(?i)/mo\s+(\d+)", 1, cmd))
+| extend short_interval = cmd has "/sc minute" and (isnull(mo) or mo <= 5)
+| where
+      cmd has_any (sus_tokens)
+   or cmd matches regex script_ext_regex
+   or (isnotempty(tr) and tr has_any (user_writable_paths))
+   or cmd has_any (sensitive_triggers)
+   or is_msi_remote
+   or short_interval
+// Agrégation (burst -> fenêtre)
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(ProcessCommandLine, 5)
+    by DeviceId, User, t2=bin(TimeGenerated, burst10m)
+| where c >= 1                       // mets 1 si tu veux plus de sensibilité
+| summarize Count=sum(c), Samples=make_set(s, 5)
+    by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="SchtasksCreate";
+// 12) cipher.exe wiping on multiple drives (burst)
+let ev_cipher_wipe_burst =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "cipher.exe" or ProcessCommandLine has "cipher"
+| where ProcessCommandLine has "/w"
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, t2=bin(TimeGenerated, 5m)
+| where c > 1
+| summarize Count=sum(c), Samples=make_set(s, 5)
+  by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="CipherWipeBurst";
+// 13) attrib.exe hiding files (+h +s)
+let ev_attrib_hide =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "attrib.exe"
+| where ProcessCommandLine has_all ("+h", "+s")
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(strcat("[", ProcessCommandLine, "]"), 5)
+  by DeviceId, User, t2=bin(TimeGenerated, 10m)
+| where c > 2
+| summarize Count=sum(c), Samples=make_set(s, 5)
+  by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="AttribHide";
+// 14) rundll32 LOLBAS (network/HTML invocation)
+let ev_rundll32_lolbas =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "rundll32.exe" or ProcessCommandLine has "rundll32"
+| where ProcessCommandLine has_any (dynamic(["javascript:", "mshtml,RunHTMLApplication", "urlmon.dll,OpenURL", "ShellExecute", "http://", "https://"]))
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(ProcessCommandLine, 10)
+  by DeviceId, User, t2=bin(TimeGenerated, 10m)
+| where c >= 2
+| summarize Count=sum(c), Samples=make_set(s, 10)
+  by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="Rundll32LOLBAS";
+// 15) BITSAdmin abuse
+let ev_bitsadmin =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) has "bitsadmin" or tolower(InitiatingProcessFileName) has "bitsadmin"
+| where ProcessCommandLine has_any (dynamic(["/addfile","/SetNotifyCmdLine","/Resume","/complete"," transfer"," download"]))
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(ProcessCommandLine, 10)
+  by DeviceId, User, t2=bin(TimeGenerated, 10m)
+| where c >= 2
+| summarize Count=sum(c), Samples=make_set(s, 10)
+  by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="BitsadminAbuse";
+// 16) reg.exe remote/scripted modifications
+let ev_reg_remote =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "reg.exe" or ProcessCommandLine has " reg "
+| where ProcessCommandLine has_any ("\\\\", "/s", "/export", "/import")
+| where ProcessCommandLine has "HKEY"
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, t2=bin(TimeGenerated, 6h)
+| where c > 0
+| summarize Count=sum(c), Samples=make_set(s, 5)
+  by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="RegRemoteModify";
+// 17) potential exfil tools burst (rclone/megacmd/winscp/ftp/curl/scp/sftp)
+let ev_exfil_tools_burst =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where ProcessCommandLine has_any (dynamic(["rclone","megacmd","winscp","ftp.exe","curl.exe"," scp "," sftp "]))
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(ProcessCommandLine, 5)
+  by DeviceId, User, t2=bin(TimeGenerated, 6h)
+| where c > 15
+| summarize Count=sum(c), Samples=make_set(s, 5)
+  by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="ExfilToolsBurst";
+// 18) PsExec / PAExec suspicious switches
+let ev_psexec_switches =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) in ("psexec.exe","paexec.exe") or ProcessCommandLine has_any (" psexec", " paexec")
+| where ProcessCommandLine has_any (dynamic(["\\\\","-s","-d","-i","-u ", "-p ", "-h","-accepteula","ADMIN$"]))
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(ProcessCommandLine, 15)
+  by DeviceId, User, t2=bin(TimeGenerated, 5m)
+| where c >= 1
+| summarize Count=sum(c), Samples=make_set(s, 15)
+  by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="PsExecSuspiciousSwitches";
+// 19) PSEXESVC service appears on target
+let ev_psexesvc_proc =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) == "psexesvc.exe" or ProcessCommandLine has "PSEXESVC"
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize Count=count(), Samples=make_set(ProcessCommandLine, 10)
+  by DeviceId, User, Bucket=bin(TimeGenerated, win)
+| extend Evidence="PSEXESVCStarted";
+// 20) PsExec executed from user-writable or Office parent (LOLBAS-ish)
+let user_writable = dynamic(["\\AppData\\","\\Temp\\","\\Roaming\\","\\Downloads\\","C:\\Users\\Public\\"]);
+let office_parents = dynamic(["WINWORD.EXE","EXCEL.EXE","POWERPNT.EXE","OUTLOOK.EXE","ONENOTE.EXE"]);
+let ev_psexec_susp_origin =
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where tolower(FileName) in ("psexec.exe","paexec.exe") or ProcessCommandLine has_any (" psexec", " paexec")
+| where FolderPath has_any (user_writable) or toupper(InitiatingProcessFileName) in (office_parents)
+| extend User = tostring(coalesce(AccountName, InitiatingProcessAccountName, ""))
+| summarize c=count(), s=make_set(ProcessCommandLine, 10)
+  by DeviceId, User, t2=bin(TimeGenerated, win)
+| where c >= 1
+| summarize Count=sum(c), Samples=make_set(s, 10)
+  by DeviceId, User, Bucket=bin(t2, win)
+| extend Evidence="PsExecSuspiciousOrigin";
+// ======================= Evidence → Stage mapping =======================
+let evidence_info = datatable(Evidence:string, Stage:string, Explanation:string)
+[
+  "VssAdminShadow",    "Impact",            "Deletion of shadow copies to prevent restoration",
+  "FsutilUsnDelete",   "Impact",        "USN journal manipulation/removal impedes recovery",
+  "BcdeditRecovery",   "Defense Evasion/Impact",       "BCDEdit disables recovery/ignores failures",
+  "WbadminDelete",     "Impact",                    "Deletion of WBADMIN backups/catalogs",
+  "WevtutilClearBurst","Defense Evasion",          "Repeated clearing of Windows event logs",
+  "WmicShadowDelete",  "Impact",            "Shadow copy deletion via WMIC",
+  "ScConfigDisabled",  "Defense Evasion",           "Services disabled via SC CONFIG",
+  "NetStopBurst",      "Defense Evasion",           "Multiple service stops via NET STOP",
+  "TaskkillBurst",     "Defense Evasion",       "Mass process termination via TASKKILL",
+  "CipherWipe",        "Impact",            "Secure wipe of free space via CIPHER /W",
+  "SchtasksCreate",    "Persistence/Execution",      "Scheduled task creation for persistence/execution",
+  "CipherWipeBurst",   "Impact",            "Multiple CIPHER /w wiping commands in short window",
+  "AttribHide",        "Defense Evasion",            "Files/directories hidden via attrib +h +s",
+  "Rundll32LOLBAS",    "Defense Evasion",            "Rundll32 used to execute via HTML/URL/JS",
+  "BitsadminAbuse",    "Defense Evasion/Persistence",          "BITSAdmin used to stage/execute/download",
+  "RegRemoteModify",   "Defense Evasion",           "Remote/scripted registry modifications",
+  "ExfilToolsBurst",   "Exfiltration",           "Burst use of rclone/megacmd/ftp/curl/scp/sftp",
+  "PsExecSuspiciousSwitches","Lateral Movement",    "PsExec/PAExec with suspicious flags/targets",
+  "PSEXESVCStarted",   "Lateral Movement",          "PSEXESVC service spawned on target host",
+  "PsExecSuspiciousOrigin","Initial Access/Defense Evasion",           "PsExec launched from user-writable or Office parent",
+];
+// ======================= Aggregation + Summary =======================
+union ev_vssadmin, ev_fsutil, ev_bcdedit, ev_wbadmin,
+      ev_wevtutil_burst, ev_wmic_shadow, ev_sc_disable,
+      ev_netstop_burst, ev_taskkill_burst, ev_cipher_wipe,
+      ev_schtasks_create, 
+      ev_cipher_wipe_burst, ev_attrib_hide, ev_rundll32_lolbas,
+      ev_bitsadmin, ev_reg_remote, ev_exfil_tools_burst,
+      ev_psexec_switches, ev_psexesvc_proc, ev_psexec_susp_origin
+| join kind=leftouter evidence_info on Evidence
+// --- Normalisation User pour éviter les doublons de buckets
+| extend User = tostring(User)
+| extend User = iif(isempty(User), "<unknown>", User)
+| extend User = tolower(
+    iif(User contains "\\", tostring(split(User, "\\")[1]),
+    iif(User contains "@",  tostring(split(User, "@")[0]), User))
+)
+// --- Un échantillon lisible
+| extend SampleOne = iif(array_length(Samples) > 0, tostring(Samples[0]), "")
+// --- Ligne lisible (pas de StageTactic/Technique, on prend Stage tel quel)
+| extend Line = strcat("- ", Stage, " | ", Explanation, " | ", "Sample: ", SampleOne)
+| summarize
+    EvidenceSet     = make_set(Evidence),
+    MitreBag        = make_bag(pack(Evidence, Stage)),
+    ExplBag         = make_bag(pack(Evidence, Explanation)),
+    LinesList       = make_list(Line),
+    TotalSignals    = sum(Count),
+    StartOfBehavior = min(Bucket)
+  by DeviceId, User, Bucket
+// ---- Flags par evidence
+| extend
+    VssAdminShadow        = iff(set_has_element(EvidenceSet, "VssAdminShadow"), 1, 0),
+    Fsutil                = iff(set_has_element(EvidenceSet, "FsutilUsnDelete"), 1, 0),
+    BcdEdit               = iff(set_has_element(EvidenceSet, "BcdeditRecovery"), 1, 0),
+    Wbadmin               = iff(set_has_element(EvidenceSet, "WbadminDelete"), 1, 0),
+    WevtutilSuspicious    = iff(set_has_element(EvidenceSet, "WevtutilClearBurst"), 1, 0),
+    WmicShadowDelete      = iff(set_has_element(EvidenceSet, "WmicShadowDelete"), 1, 0),
+    ScDisable             = iff(set_has_element(EvidenceSet, "ScConfigDisabled"), 1, 0),
+    NetStopSuspicious     = iff(set_has_element(EvidenceSet, "NetStopBurst"), 1, 0),
+    TaskKillSuspicious    = iff(set_has_element(EvidenceSet, "TaskkillBurst"), 1, 0),
+    CipherSuspicious      = iff(set_has_element(EvidenceSet, "CipherWipe"), 1, 0),
+    SchtasksCreated       = iff(set_has_element(EvidenceSet, "SchtasksCreate"), 1, 0),
+    CipherWipeBurst       = iff(set_has_element(EvidenceSet, "CipherWipeBurst"), 1, 0),
+    AttribHide            = iff(set_has_element(EvidenceSet, "AttribHide"), 1, 0),
+    Rundll32LOLBAS        = iff(set_has_element(EvidenceSet, "Rundll32LOLBAS"), 1, 0),
+    BitsadminAbuse        = iff(set_has_element(EvidenceSet, "BitsadminAbuse"), 1, 0),
+    RegRemoteModify       = iff(set_has_element(EvidenceSet, "RegRemoteModify"), 1, 0),
+    ExfilToolsBurst       = iff(set_has_element(EvidenceSet, "ExfilToolsBurst"), 1, 0),
+    PsExecSuspiciousSwitches = iff(set_has_element(EvidenceSet, "PsExecSuspiciousSwitches"), 1, 0),
+    PSEXESVCStarted       = iff(set_has_element(EvidenceSet, "PSEXESVCStarted"), 1, 0),
+    PsExecSuspiciousOrigin= iff(set_has_element(EvidenceSet, "PsExecSuspiciousOrigin"), 1, 0),
+    UniqueEvidenceCount   = array_length(EvidenceSet)
+// ---- Garde-fou: garder seulement les buckets intéressants
+| where UniqueEvidenceCount > 2
+// ---- (1) Scalars pour Summary
+| extend
+    IntroTxt = "🚨 Suspicious Windows Activities Detected",
+    WhoTxt   = iif(isempty(User), "<unknown>", tostring(User)),
+    WhereTxt = tostring(DeviceId),
+    WhenTxt  = strcat(format_datetime(Bucket, "yyyy-MM-dd HH:mm:ss"), " UTC")
+// ---- (2) Texte des lignes
+| extend LinesText = strcat_array(LinesList, "\n   ")
+// ---- (3) Narratif par flag
+| extend
+    FlagNarrative = strcat(
+        iif(VssAdminShadow==1,         "⚠️ Shadow copies deleted via VSSADMIN [Impact | Inhibit System Recovery (T1490)]\n", ""),
+        iif(Fsutil==1,                 "⚠️ USN journal deleted via FSUTIL [Impact | Anti-Recovery]\n", ""),
+        iif(BcdEdit==1,                "⚠️ Boot configuration modified via BCDEdit [Defense Evasion / Impact]\n", ""),
+        iif(Wbadmin==1,                "⚠️ Backup catalogs deleted via WBADMIN [Impact | Destroy Backups]\n", ""),
+        iif(WevtutilSuspicious==1,     "⚠️ Event logs cleared via WEVTUTIL [Defense Evasion | Clear Event Logs (T1070.001)]\n", ""),
+        iif(WmicShadowDelete==1,       "⚠️ Shadow copies deleted via WMIC [Impact | Inhibit System Recovery (T1490)]\n", ""),
+        iif(ScDisable==1,              "⚠️ Services disabled via SC CONFIG [Defense Evasion | Impair Defenses (T1562)]\n", ""),
+        iif(NetStopSuspicious==1,      "⚠️ Multiple services stopped via NET STOP [Defense Evasion | Impair Defenses (T1562)]\n", ""),
+        iif(TaskKillSuspicious==1,     "⚠️ Processes terminated via TASKKILL [Defense Evasion | Process Termination (T1489)]\n", ""),
+        iif(CipherSuspicious==1,       "⚠️ Free space wiped via CIPHER /w [Impact | Data Destruction]\n", ""),
+        iif(SchtasksCreated==1,        "⚠️ Scheduled tasks created [Persistence/Execution | Scheduled Task (T1053.005)]\n", ""),
+        iif(CipherWipeBurst==1,        "⚠️ Multiple CIPHER /w wipes in short window [Impact | Data Destruction (T1485)]\n", ""),
+        iif(AttribHide==1,             "⚠️ Files hidden via attrib +h +s [Defense Evasion | Hide Artifacts (T1564.001)]\n", ""),
+        iif(Rundll32LOLBAS==1,         "⚠️ rundll32 used as LOLBAS [Defense Evasion | Signed Binary Proxy (T1218.011)]\n", ""),
+        iif(BitsadminAbuse==1,         "⚠️ BITSAdmin abused for staging/execution [Persistence/Evasion | Bits (T1197)]\n", ""),
+        iif(RegRemoteModify==1,        "⚠️ Registry modified remotely/scripted [Defense Evasion | Modify Registry (T1112)]\n", ""),
+        iif(ExfilToolsBurst==1,        "⚠️ Possible exfil tools burst [Exfiltration | Cloud/alt Channels (T1567)] \n", ""),
+        iif(PsExecSuspiciousSwitches==1,"⚠️ PsExec/PAExec with suspicious switches/targets [Lateral Movement | Remote Services (T1021.002)]\n", ""),
+        iif(PSEXESVCStarted==1,        "⚠️ PSEXESVC service observed on target [Lateral Movement | Remote Services (T1021.002)]\n", ""),
+        iif(PsExecSuspiciousOrigin==1, "⚠️ PsExec launched from user-writable or Office parent [Defense Evasion/Initial Access (T1204.002)]\n", "")
+    )
+// ---- (4) Summary final
+| extend
+    Summary = strcat(
+        IntroTxt, "\n",
+        "• Who (Account): ", WhoTxt, "\n",
+        "• Where (DeviceId): ", WhereTxt, "\n",
+        "• When (Bucket): ", WhenTxt, "\n",
+        "• What (", tostring(UniqueEvidenceCount), " Distinct Indicators / ", tostring(TotalSignals), " Events):\n   ",
+           LinesText, "\n",
+        FlagNarrative,
+        "• First time seen: ", strcat(format_datetime(StartOfBehavior, "yyyy-MM-dd HH:mm:ss"), " UTC"), "\n",
+        "🛑 This activity aligns with ransomware or destructive attack patterns. Investigate immediately."
+    )
+// ---- Projection
+| project
+    TimeBucket = Bucket,
+    DeviceId,
+    User,
+    UniqueEvidenceCount,
+    TotalSignals,
+    VssAdminShadow, Fsutil, BcdEdit, Wbadmin,
+    WevtutilSuspicious, WmicShadowDelete, ScDisable,
+    NetStopSuspicious, TaskKillSuspicious, CipherSuspicious, SchtasksCreated,
+    CipherWipeBurst,
+    AttribHide, 
+    Rundll32LOLBAS,
+    BitsadminAbuse,
+    RegRemoteModify,
+    ExfilToolsBurst,
+    PsExecSuspiciousSwitches,
+    PSEXESVCStarted, 
+    PsExecSuspiciousOrigin, 
+    StartOfBehavior,
+    EvidenceSet,
+    LinesList,
+    Summary
+| order by TimeBucket desc
+
+
