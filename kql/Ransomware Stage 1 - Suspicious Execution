@@ -1,0 +1,339 @@
+// [Ransomware - Stage 1] Suspicious Execution Techniques
+let timeRange = 90d;
+let binSize   = 15m;
+  // Whitelist chemins sensibles
+  let IsSensitivePath = (path: string) {
+    isnotempty(path) and (
+         path startswith @'C:\Windows\Temp'
+      or path startswith @'C:\Windows\SystemTemp'
+      or path startswith @'C:\PerfLogs'
+      or path contains   @'\Windows\Tasks\'
+      or path contains   @'\Windows\System32\Tasks\'
+      or path contains   @'\Windows\System32\spool\drivers\'
+      or path contains   @'\Windows\SysWOW64\spool\drivers\'
+      or path contains   @'\Users\Public\'
+      or path contains   @'\Users\Default\'
+      or path contains   @'\AppData\Local\Temp\'
+      or path contains   @'\AppData\LocalLow\'
+      or path contains   @'\AppData\Roaming\'
+      or path contains   @'\OneDrive\'
+      or path contains   @'\Downloads\'
+      or path contains   @'\AppData\Local\Microsoft\Windows\INetCache\'
+      or path contains   @'\AppData\Local\Microsoft\Windows\Temporary Internet Files\'
+      or path contains   @'\$Recycle.Bin\'
+    )
+  };
+  // 1️⃣ Suspicious PowerShell Execution
+  let SuspiciousPowerShell =
+      DeviceProcessEvents
+      | where TimeGenerated > ago(timeRange)
+      | where FileName =~ "powershell.exe"
+      | where ProcessCommandLine has_any ("DownloadString", "Invoke-WebRequest", "IEX", "Invoke-Expression")
+      | summarize
+          EventCount = count(),
+          Commands = make_set(strcat("[", ProcessCommandLine, "]"), 3),
+          Accounts = make_set(AccountName),
+          PrimaryAccount = tostring(max(AccountName)),
+          FirstSeen = min(TimeGenerated),
+          Parent = tostring(max(InitiatingProcessFileName)),
+          ParentSigned = tostring(max(InitiatingProcessSignatureStatus)),
+          Initiators = make_set(InitiatingProcessFileName, 3)
+          by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+      | where EventCount > 1
+      | extend
+          Signal = "Suspicious PowerShell Execution",
+          Severity = "🟠 Medium",
+          Summary = strcat(
+              "⚠️ Suspicious PowerShell Execution Detected\n",
+              "• Who: ", strcat_array(Accounts, ", "), "\n",
+              "• What: PowerShell executed potentially dangerous commands\n",
+              "• Commands: ", strcat_array(Commands, " | "), "\n",
+              "• Initiating Processes: ", strcat_array(Initiators, " | "), "\n",
+              "• Parent: ", tostring(Parent), " (Signed: ", tostring(ParentSigned), ")\n",
+              "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+              "• From Device: ", DeviceId, "\n",
+              "🛑 PowerShell is frequently abused by attackers to download and execute malicious payloads without dropping files."
+          );
+  // 2️⃣ Suspicious rundll32.exe Usage (arguments suspects / chemins user-writable)
+  let SuspiciousRundll32 =
+      DeviceProcessEvents
+      | where TimeGenerated > ago(timeRange)
+      | where FileName =~ "rundll32.exe"
+      | where strlen(ProcessCommandLine) < 20 or ProcessCommandLine !contains ".dll"
+      | where IsSensitivePath(ProcessCommandLine) or (InitiatingProcessSignatureStatus != "Valid" or isnull(InitiatingProcessSignatureStatus))
+      | project TimeGenerated, DeviceId, DeviceName, AccountName, ProcessCommandLine,
+                FolderPath, InitiatingProcessFileName, InitiatingProcessSignatureStatus
+      | summarize
+          EventCount = count(),
+          Commands = make_set(strcat("[", ProcessCommandLine, "]"), 3),
+          Folders = make_set(FolderPath, 3),
+          Accounts = make_set(AccountName),
+          PrimaryAccount = tostring(max(AccountName)),
+          Parent = tostring(max(InitiatingProcessFileName)),
+          ParentSigned = tostring(max(InitiatingProcessSignatureStatus)),
+          FirstSeen = min(TimeGenerated)
+          by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+      | where EventCount > 0
+      | extend
+          Signal = "Suspicious rundll32.exe Execution",
+          Severity = "🟡 Low",
+          Summary = strcat(
+              "⚠️ Suspicious rundll32.exe usage targeting user-writable paths or malformed args\n",
+              "• Who: ", strcat_array(Accounts, ", "), "\n",
+              "• What: rundll32.exe launched with suspicious/malformed arguments\n",
+              "• Commands: ", strcat_array(Commands, " | "), "\n",
+              "• Folder(s): ", strcat_array(Folders, " | "), "\n",
+              "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+              "• Parent: ", tostring(Parent), " (Signed: ", tostring(ParentSigned), ")\n",
+              "• From Device: ", DeviceId, "\n",
+              "🛑 rundll32.exe misuse is a known technique to execute malicious DLLs or scripts stealthily."
+          );
+  //  TI SHA256 (pour HiddenExeDrop_TIMatch)
+  let TI_SHA256 =
+      ThreatIntelIndicators
+      | where TimeGenerated > ago(timeRange) and IsActive == true
+      | where tolower(ObservableKey) == "file:hashes.'sha-256'"
+      | extend j = parse_json(Data)
+      | project
+          TI_SHA256    = tolower(ObservableValue),
+          TI_Name      = tostring(j.name),
+          TI_Confidence= toint(j.confidence),
+          TI_ValidFrom = coalesce(todatetime(j.valid_from), datetime(1970-01-01)),
+          TI_ValidUntil= coalesce(todatetime(tostring(j.valid_until)), ValidUntil, datetime(9999-12-31)),
+          TI_Source    = SourceSystem;
+  // 3️⃣ Executable Dropped in Sensitive Folders + TI match
+  let HiddenExeDrop_TIMatch =
+      DeviceFileEvents
+      | where TimeGenerated > ago(timeRange) and ActionType == "FileCreated"
+      | where isnotempty(FolderPath)
+      | where IsSensitivePath(FolderPath)
+      | where isnotempty(SHA256)
+      | extend FileSHA256 = tolower(SHA256)
+      | join kind=innerunique TI_SHA256 on $left.FileSHA256 == $right.TI_SHA256
+      | where TimeGenerated >= TI_ValidFrom and TimeGenerated <= TI_ValidUntil
+      | summarize
+          EventCount    = count(),
+          SampleFiles   = make_set(strcat("[", FileName, "]"), 3),
+          SampleFolders = make_set(FolderPath, 3),
+          SampleHashes  = make_set(FileSHA256, 3),
+          Accounts      = make_set(InitiatingProcessAccountName),
+          PrimaryAccount= tostring(max(InitiatingProcessAccountName)),
+          Initiators    = make_set(InitiatingProcessFileName, 3),
+          Parent        = tostring(max(InitiatingProcessFileName)),
+          TI_Names      = make_set(TI_Name, 3),
+          TI_Sources    = make_set(TI_Source, 3),
+          TI_ConfMax    = max(TI_Confidence),
+          FirstSeen     = min(TimeGenerated)
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+      | extend
+          Signal = "Executable Dropped in Sensitive Folders + TI match",
+          Severity = "🟠 Medium",
+          Summary = strcat(
+              "⚠️ Executable drop in sensitive paths with TI match\n",
+              "• Who: ", strcat_array(Accounts, ", "), " (Primary: ", PrimaryAccount, ")\n",
+              "• What: File(s) created in sensitive folders with known-bad TI hash\n",
+              "• Files: ", strcat_array(SampleFiles, " | "), "\n",
+              "• Hashes: ", strcat_array(SampleHashes, " | "), "\n",
+              "• Where: ", strcat_array(SampleFolders, " | "), "\n",
+              "• Initiators: ", strcat_array(Initiators, " | "), "\n",
+              "• Parent: ", tostring(Parent), "\n",
+              "• TI: ", strcat_array(TI_Names, " | "), " | Source: ", strcat_array(TI_Sources, " | "),
+              " | Confidence(max): ", tostring(TI_ConfMax), "\n",
+              "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+              "• From Device: ", DeviceId, " (", DeviceName, ")", "\n",
+              "🛑 Dropped executables in sensitive OS paths that match threat intelligence are highly indicative of ransomware staging or malware deployment."
+          );
+  // 4️⃣ MSHTA téléchargements/exec depuis URL
+  let MshtaRemote =
+      DeviceProcessEvents
+      | where TimeGenerated > ago(timeRange)
+      | where FileName =~ "mshta.exe"
+      | where ProcessCommandLine contains "http" or ProcessCommandLine contains "https"
+      | summarize
+          EventCount = count(),
+          Accounts = make_set(AccountName),
+          PrimaryAccount = tostring(max(AccountName)),
+          FirstSeen = min(TimeGenerated),
+          Commands = make_set(strcat("[", ProcessCommandLine, "]"), 3),
+          Parent   = tostring(max(InitiatingProcessFileName)),
+          ParentSigned = tostring(max(InitiatingProcessSignatureStatus))
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+      | extend
+          Signal = "MSHTA remote content execution",
+          Severity = "🔴 High",
+          Summary = strcat(
+              "⚠️ mshta.exe executed remote content\n",
+              "• Who: ", strcat_array(Accounts, ", "), "\n",
+              "• What: mshta with remote URL\n",
+              "• Commands: ", strcat_array(Commands, " | "), "\n",
+              "• Parent: ", tostring(Parent), " (Signed: ", tostring(ParentSigned), ")\n",
+              "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+              "• From Device: ", DeviceId, " (", DeviceName, ")\n",
+              "🛑 mshta.exe is often leveraged to execute remote malicious scripts or payloads directly from the web."
+          );
+  // 5️⃣ Regsvr32 scriptlet à distance
+  let Regsvr32Remote =
+      DeviceProcessEvents
+      | where TimeGenerated > ago(timeRange)
+      | where FileName =~ "regsvr32.exe"
+      | where ProcessCommandLine has_any ("scrobj.dll", "/i:", "/i ")
+      | where ProcessCommandLine contains "http" or ProcessCommandLine contains "https"
+      | summarize
+          EventCount = count(),
+          Accounts = make_set(AccountName),
+          PrimaryAccount = tostring(max(AccountName)),
+          FirstSeen = min(TimeGenerated),
+          Commands = make_set(strcat("[", ProcessCommandLine, "]"), 3),
+          Parent   = tostring(max(InitiatingProcessFileName)),
+          ParentSigned = tostring(max(InitiatingProcessSignatureStatus))
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+      | extend
+          Signal = "Regsvr32 remote scriptlet (Squiblydoo)",
+          Severity = "🔴 High",
+          Summary = strcat(
+              "⚠️ regsvr32.exe loading remote scriptlet\n",
+              "• Who: ", strcat_array(Accounts, ", "), "\n",
+              "• What: regsvr32 with remote /i or scrobj.dll\n",
+              "• Commands: ", strcat_array(Commands, " | "), "\n",
+              "• Parent: ", tostring(Parent), " (Signed: ", tostring(ParentSigned), ")\n",
+              "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+              "• From Device: ", DeviceId, " (", DeviceName, ")\n",
+              "🛑 regsvr32.exe can be abused to bypass application whitelisting and load remote COM scriptlets over HTTP."
+          );
+  // 6️⃣ Rundll32 abus HTML/JS
+  let Rundll32ScriptAbuse =
+      DeviceProcessEvents
+      | where TimeGenerated > ago(timeRange)
+      | where FileName =~ "rundll32.exe"
+      | where ProcessCommandLine has_any ("mshtml.dll,RunHTMLApplication", "javascript:")
+      | summarize
+          EventCount = count(),
+          Accounts = make_set(AccountName),
+          PrimaryAccount = tostring(max(AccountName)),
+          FirstSeen = min(TimeGenerated),
+          Commands = make_set(strcat("[", ProcessCommandLine, "]"), 3),
+          Parent   = tostring(max(InitiatingProcessFileName)),
+          ParentSigned = tostring(max(InitiatingProcessSignatureStatus))
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+      | extend
+          Signal = "Rundll32 HTML/JS execution abuse",
+          Severity = "🔴 High",
+          Summary = strcat(
+              "⚠️ rundll32.exe abusing HTML/JS execution\n",
+              "• Who: ", strcat_array(Accounts, ", "), "\n",
+              "• What: rundll32 with mshtml/javascript\n",
+              "• Commands: ", strcat_array(Commands, " | "), "\n",
+              "• Parent: ", tostring(Parent), " (Signed: ", tostring(ParentSigned), ")\n",
+              "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+              "• From Device: ", DeviceId, " (", DeviceName, ")\n",
+              "🛑 rundll32.exe with mshtml.dll is a known technique to execute malicious HTML/JS payloads in memory."
+          );
+  // 7️⃣ Rundll32 INF install abuse
+  let Rundll32InfAbuse =
+      DeviceProcessEvents
+      | where TimeGenerated > ago(timeRange)
+      | where FileName =~ "rundll32.exe"
+      | where ProcessCommandLine has_any ("advpack.dll,LaunchINFSection", "setupapi.dll,InstallHinfSection")
+      | where not (
+          (InitiatingProcessFileName =~ "msiexec.exe"
+            and InitiatingProcessSignatureStatus == "Valid"
+            and (InitiatingProcessCommandLine contains "-Embedding" or ProcessCommandLine contains ".inf")
+            and (ProcessCommandLine contains @"\Program Files" or ProcessCommandLine contains @'C:\Windows\INF\' or ProcessCommandLine contains @'\DriverStore\'))
+          or ProcessCommandLine contains @'\Netskope\EPDLP'
+          or (InitiatingProcessFileName =~ "setup.exe" and InitiatingProcessFolderPath contains 'NVIDIA' and ProcessCommandLine contains ".inf")
+          or ProcessCommandLine contains "aehd.Inf"
+          or ProcessCommandLine contains "Android_Emulator_Hypervisor_Driver"
+        )
+      | summarize
+          EventCount = count(),
+          Accounts = make_set(AccountName),
+          PrimaryAccount = tostring(max(AccountName)),
+          FirstSeen = min(TimeGenerated),
+          Commands = make_set(strcat("[", ProcessCommandLine, "]"), 3),
+          Parent   = tostring(max(InitiatingProcessFileName)),
+          ParentSigned = tostring(max(InitiatingProcessSignatureStatus))
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+      | extend
+          Signal = "Rundll32 INF install suspicious",
+          Severity = "🟡 Low",
+          Summary = strcat(
+              "⚠️ rundll32.exe INF install pattern (post-benign exclusions)\n",
+              "• Who: ", strcat_array(Accounts, ", "), "\n",
+              "• What: advpack/setupapi INF install usage\n",
+              "• Commands: ", strcat_array(Commands, " | "), "\n",
+              "• Parent: ", tostring(Parent), " (Signed: ", tostring(ParentSigned), ")\n",
+              "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+              "• From Device: ", DeviceId, " (", DeviceName, ")\n",
+              "🛑 rundll32.exe invoking INF installation routines can be abused by attackers to install malicious drivers or persistence mechanisms."
+          );
+  // 8️⃣ Certutil/BITS staging
+  let CertutilBitsAbuse =
+      DeviceProcessEvents
+      | where TimeGenerated > ago(timeRange)
+      | where FileName in~ ("certutil.exe", "bitsadmin.exe")
+      | where ProcessCommandLine has_any ("-urlcache", "-decode", "/transfer", "/addfile")
+      | where not (
+          FileName =~ "certutil.exe"
+          and ProcessCommandLine has "-decode"
+          and not(ProcessCommandLine has "http" or ProcessCommandLine has "https")
+        )
+      | extend
+          Urls_ex = extract_all(@"(https?://[^\s'\""]+)", ProcessCommandLine),
+          Targets_ex = extract_all(@"([^\s'\""]+\.(?:exe|dll|ps1|vbs|scr|msi))", ProcessCommandLine)
+      | summarize
+          EventCount = count(),
+          Accounts = make_set(AccountName),
+          PrimaryAccount = tostring(max(AccountName)),
+          FirstSeen = min(TimeGenerated),
+          Commands = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+          Parent = tostring(max(InitiatingProcessFileName)),
+          ParentSigned = tostring(max(InitiatingProcessSignatureStatus)),
+          UrlsAgg = make_set(Urls_ex, 5),
+          TargetsAgg = make_set(Targets_ex, 5)
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+      | extend
+          UrlsAgg = coalesce(UrlsAgg, dynamic([])),
+          TargetsAgg = coalesce(TargetsAgg, dynamic([])),
+          UrlsCount = array_length(UrlsAgg),
+          TargetsCount = array_length(TargetsAgg)
+      | extend
+          HasExternalUrl = iff(UrlsCount > 0, true, false),
+          HasBinaryTarget = iff(TargetsCount > 0, true, false)
+      | extend
+          Signal = "Certutil/BITS suspicious staging",
+          Severity = case(HasExternalUrl or HasBinaryTarget or ParentSigned != "Valid", "🔴 High", "🟠 Medium"),
+          Summary = strcat(
+              "⚠️ certutil/bitsadmin suspicious usage\n",
+              "• Who: ", strcat_array(Accounts, ", "), "\n",
+              "• What: urlcache/decode/transfer/addfile observed\n",
+              "• Commands: ", strcat_array(Commands, " | "), "\n",
+              "• Parent: ", tostring(Parent), " (Signed: ", tostring(ParentSigned), ")\n",
+              "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+              "• From Device: ", DeviceId, " (", DeviceName, ")\n",
+              "🛑 Living-off-the-land binaries such as certutil and bitsadmin are commonly misused to download or decode malicious content."
+          );
+ // 🔄 Union
+let BaseAlerts =
+    union SuspiciousPowerShell, SuspiciousRundll32, HiddenExeDrop_TIMatch, MshtaRemote,
+          Regsvr32Remote, Rundll32ScriptAbuse, Rundll32InfAbuse, CertutilBitsAbuse
+    | project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary
+    | extend JoinKey = tolower(PrimaryAccount);
+let IdxIdentity =
+(
+    IdentityInfo
+    | where TimeGenerated > ago(90d)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN, AccountName, AccountDomain
+    | extend KeyCandidates = pack_array(
+        tolower(tostring(AccountUPN)),
+        tolower(tostring(AccountName)),
+        tolower(strcat(tostring(AccountDomain), "\\", tostring(AccountName))),
+        tolower(tostring(MailAddress))
+      )
+    | mv-expand Key = KeyCandidates to typeof(string)
+    | where isnotempty(Key)
+    | summarize UserFullName = any(AccountDisplayName) by Key
+);
+BaseAlerts
+| join kind=leftouter IdxIdentity on $left.JoinKey == $right.Key
+| extend UserFullName = tostring(coalesce(UserFullName, ""))
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, UserFullName, Signal, Severity, Summary
