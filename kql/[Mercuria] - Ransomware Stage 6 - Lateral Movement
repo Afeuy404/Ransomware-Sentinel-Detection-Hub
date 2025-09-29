@@ -1,0 +1,533 @@
+// [Ransomware - Stage 6] Lateral Movement Tools and Patterns
+let timeRange = 90d;
+let binSize   = 15m;
+// ---------- Helpers ----------
+let IsUserWritablePath = (s:string) {
+  tolower(s) has @"\appdata\" or tolower(s) has @"\temp\" or tolower(s) has @"\roaming\"
+  or tolower(s) has @"\downloads\" or tolower(s) has @"\users\public\" or tolower(s) has @"\programdata\"
+};
+let IsAbuseFlag = (s:string) {
+  tolower(s) has_any (dynamic([
+    " -enc ", "-encodedcommand", "-nop", "-w hidden", "/c ",
+    "invoke-webrequest", "iwr", "invoke-expression", "iex", "downloadstring", "start-bitstransfer",
+    "mshtml.dll,runhtmlapplication", "javascript:", "scrobj.dll", "/i:",
+    "http://", "https://",
+    "\\\\", "\\admin$", "\\c$"
+  ]))
+  or IsUserWritablePath(s)
+};
+// High-risk & allowlist for remote service ops
+let HighRiskSvcHints = dynamic([
+  "defend","sense","nissvc","mssense","wd","sophos","mcafee","crowdstrike","csfalcon","cylance","sentinel","bitdefender","eset","kaspersky","trend",
+  "veeam","backup","wbengine","vss","shadow","sql","mssql","sqlwriter","exchange"
+]);
+let AllowSvcHints = dynamic([
+  "openlink_endur","endur_","openlink",
+  "configmgr","sccm","wake-up proxy","wakeup","wake up"   // SCCM Wake-up Proxy allowlist
+]);
+// 1️⃣ WMIC remote execution 
+let WMIC_RemoteExec =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "wmic.exe"
+| extend cmd = tolower(ProcessCommandLine),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Signed", "Unsigned/Unknown")
+| where cmd has "process call create" or cmd matches regex @"(?i)\b/node\s*:|/node:\s*\\\\|/node\s+\\\\"
+| summarize
+    EventCount = count(),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents    = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount > 0
+| extend
+  Signal = "Remote Execution via WMIC",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    "🚨 WMIC remote execution pattern detected (process call create / /node:)\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSigs, ", "), ")\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Events: ", tostring(EventCount), " | First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "📌 Remote WMIC is a classic lateral-movement TTP to launch binaries/services on remote hosts."
+  );
+// 2️⃣ PsExec usage 
+let PsExec_RemoteExec =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| extend cmd = tolower(ProcessCommandLine),
+         fn  = tolower(FileName),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Signed", "Unsigned/Unknown")
+| where fn matches regex @"(?i)psexec(\.exe)?$"
+   or cmd has "psexec"
+   or fn =~ "psexesvc.exe"
+   or (fn =~ "sc.exe" and cmd matches regex @"(?i)\bsc(\.exe)?\s+create\s+PSEXESVC\b")
+| summarize
+    EventCount = count(),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents    = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount > 0
+| extend
+  Signal = "Remote Execution via PsExec",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    "🚨 PsExec activity observed (psexec / PSEXESVC)\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSigs, ", "), ")\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Events: ", tostring(EventCount), " | First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "📌 PsExec is frequently used to push/launch payloads over SMB/SCM during lateral movement."
+  );
+//  3️⃣  wmiprvse.exe spawning suspicious children 
+let WmiPrvse_Spawn_Suspicious =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| extend Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Signed", "Unsigned/Unknown"),
+         cmd = tolower(ProcessCommandLine),
+         acc = tolower(AccountName),
+         fn  = tolower(FileName)
+| where Parent =~ "wmiprvse.exe"
+| where fn in~ ("cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","regsvr32.exe","mshta.exe","rundll32.exe","net.exe","net1.exe")
+      and IsAbuseFlag(cmd)
+| where acc !in~ ("system","local service","network service","local system")
+// exclude common SCCM Users*.cmd in ccmcache and some mgmt parents
+| where not (cmd matches regex @"(?i)\\windows\\ccmcache\\[^\\]+\\users(setup|repair|remove)\.cmd""?")
+| where not (Parent in~ ("ccmexec.exe","intunemanagementextension.exe","softwarecenter.exe","sccmsetup.exe"))
+| summarize
+    EventCount = count(),
+    DistinctChildren = dcount(FileName),
+    Children   = make_set(FileName, 10),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount >= 2 or DistinctChildren >= 2
+| extend
+  Signal = "Suspicious Processes Spawned by wmiprvse.exe",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    "🚨 WMI-based remote execution burst (wmiprvse spawning LOLBins/scripts with abuse flags)\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Child processes: ", strcat_array(Children, ", "), "\n",
+    "• Parent: wmiprvse.exe (Signature: ", strcat_array(ParentSigs, ", "), ")\n",
+    "• Commands (sample): ", strcat_array(Commands, " | "), "\n",
+    "• Events in ", tostring(binSize), ": ", tostring(EventCount), " (", tostring(DistinctChildren), " distinct children)\n",
+    "• First time seen: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "📌 Bursts via WMI with abuse indicators strongly suggest remote-controlled execution/lateral movement."
+  );
+// 4️⃣ Remote registry operations via reg.exe
+let RegistryRemoteOps_Tuned =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "reg.exe"
+| extend cmd = tolower(ProcessCommandLine),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Signed", "Unsigned/Unknown")
+| extend Op = extract(@"(?i)\breg(?:\.exe)?\s+(add|delete|copy|restore|import|load|unload|save|export|query)\b", 1, cmd),
+         RemoteHost = extract(@"(?i)\breg(?:\.exe)?\s+(?:add|delete|copy|restore|import|load|unload|save|export|query)\s+\\\\([^\\\s]+)\\(hklm|hku|hkcu|hkcr|hkcc)\b", 1, cmd),
+         Hive = extract(@"(?i)\breg(?:\.exe)?\s+(?:add|delete|copy|restore|import|load|unload|save|export|query)\s+\\\\[^\\\s]+\\(hklm|hku|hkcu|hkcr|hkcc)\b", 1, cmd)
+| where isnotempty(RemoteHost) and RemoteHost !in~ ("127.0.0.1", "localhost")
+| extend IsWriteOp = tolower(Op) in~ ("add","delete","copy","restore","import","load","unload")
+| summarize
+    EventCount = count(),
+    Ops        = make_set(Op, 10),
+    RemoteHosts= make_set(RemoteHost, 10),
+    Hives      = make_set(Hive, 10),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Accounts   = make_set(AccountName),
+    Parents    = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize), IsWriteOp
+| where EventCount > 0
+| extend
+  Signal = iff(IsWriteOp, "Remote Registry WRITE via reg.exe", "Remote Registry READ via reg.exe"),
+  Severity = iff(IsWriteOp, "🔴 High", "🟠 Medium"),
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    iff(IsWriteOp, "🚨 Remote registry WRITE operation detected", "🔎 Remote registry READ operation detected"), "\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Remote host(s): ", strcat_array(RemoteHosts, ", "), " | Hive(s): ", strcat_array(Hives, ", "), "\n",
+    "• Operation(s): ", strcat_array(Ops, ", "), "\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Events: ", tostring(EventCount), " | First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "📌 Remote registry access avoids interactive logon and is often used for persistence/evasion on nearby hosts."
+  );
+// 5️⃣ PowerShell Remoting / WinRM client-side
+let WinRM_PowerShell_Client =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("powershell.exe","pwsh.exe","winrs.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where
+  (FileName in~ ("powershell.exe","pwsh.exe")
+    and (
+      cmd matches regex @"(?i)\b(invoke-command|enter-pssession|new-pssession)\b.*\b(-computername|-cn|-hostname|-session)\b"
+      or cmd matches regex @"(?i)\bcopy-item\b.*\b-?tosession\b"
+    )
+  )
+  or (FileName =~ "winrs.exe" and cmd matches regex @"(?i)\bwinrs(\.exe)?\s+(-r:|/r:)\s*([^\s]+)")
+| extend Remote =
+  coalesce(
+    extract(@"(?i)\bwinrs(?:\.exe)?\s+(?:-r:|/r:)\s*([^\s]+)",1,cmd),
+    extract(@"(?i)\b(?:-computername|-cn)\s+([^\s,;]+)",1,cmd),
+    extract(@"(?i)\b-hostname\s+([^\s,;]+)",1,cmd)
+  )
+| where isnotempty(Remote) and Remote !in~ ("localhost","127.0.0.1",".")
+| summarize
+    EventCount = count(),
+    Remotes    = make_set(Remote, 10),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents    = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount > 0
+| extend
+  Signal = "PowerShell Remoting / WinRM (client-side)",
+  Severity = "🟠 Medium",
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    "⚠️ PowerShell Remoting / WinRS to remote hosts\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Remote(s): ", strcat_array(Remotes, ", "), "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSigs, ", "), ")\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Events: ", tostring(EventCount), " | First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "📌 Establishing remote sessions/commands often precedes payload staging and lateral deployment."
+  );
+// 6️⃣  wsmprovhost.exe spawning (server-side)
+let Wsmprovhost_Spawn_Suspicious =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| extend Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown"),
+         cmd = tolower(ProcessCommandLine),
+         acc = tolower(AccountName)
+| where Parent =~ "wsmprovhost.exe"
+| where FileName in~ ("powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","mshta.exe")
+      and (cmd has_any (" -enc ","-encodedcommand"," -nop "," -w hidden ","/c ","http://","https://","\\\\" ))
+| summarize
+    EventCount = count(),
+    Children   = make_set(FileName, 10),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount >= 2
+| extend
+  Signal = "Suspicious Processes Spawned by wsmprovhost.exe",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    "🚨 Remote execution via WinRM (wsmprovhost spawning LOLBins/scripts)\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Child processes: ", strcat_array(Children, ", "), " (Parent signed: ", strcat_array(ParentSigs, ", "), ")\n",
+    "• Commands (sample): ", strcat_array(Commands, " | "), "\n",
+    "• Events (", tostring(binSize), " window): ", tostring(EventCount), "\n",
+    "• First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), " | Device: ", DeviceId, " (", DeviceName, ")\n",
+    "📌 LoLBins under wsmprovhost typically indicate active PowerShell Remoting on the target host."
+  );
+//  7️⃣ schtasks /S remote
+let Schtasks_Remote =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("schtasks.exe","schtasks.com")
+| extend cmd = tolower(ProcessCommandLine),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| extend Remote = extract(@"(?i)\b/s\s+([^\s""]+)",1,cmd)
+| where isnotempty(Remote) and Remote !in~ ("127.0.0.1","localhost",".")
+| where cmd has_any ("/create","/run","/change","/delete")
+| extend tr = tolower(extract(@"(?i)\b/tr\s+""?([^""]+)""?",1,cmd))
+| where isnotempty(tr) and (
+      tr matches regex @"(?i)\.(ps1|bat|cmd|vbs|js)\b"
+   or tr has_any ("powershell","wscript","cscript","mshta","rundll32","regsvr32","certutil","bitsadmin","curl","ftp.exe")
+   or tr has_any ("\\appdata\\","\\programdata\\","\\users\\public\\","\\temp\\","http://","https://","\\\\")
+)
+| summarize
+    EventCount = count(),
+    Actions    = make_set(iif(cmd has "/create","create", iif(cmd has "/run","run", iif(cmd has "/change","change","delete"))), 10),
+    Remotes    = make_set(Remote, 10),
+    Targets    = make_set(tr, 10),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Accounts   = make_set(AccountName),
+    Parents    = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| extend
+  Signal = "Remote Scheduled Task (schtasks /S)",
+  Severity = iff(array_index_of(Actions,"create") >= 0, "🔴 High", "🟠 Medium"),
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+   "🚨 Remote scheduled task detected (schtasks /S)\n",
+    "• Who: ", PrimaryAccount, " | Remote(s): ", strcat_array(Remotes, ", "), "\n",
+    "• Action(s): ", strcat_array(Actions, ", "), " | Target(s): ", strcat_array(Targets, " | "), "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSigs, ", "), ")\n",
+    "• Commands: ", strcat_array(Commands, " | "), " | First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "📌 Remote schtasks is a common vector to establish persistence/execution on adjacent hosts."
+  );
+//  8️⃣  PowerShell WMI/CIM remote process creation 
+let PS_WMI_CIM_RemoteExec =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("powershell.exe","pwsh.exe")
+| extend cmd = tolower(ProcessCommandLine),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where
+  (cmd matches regex @"(?i)\binvoke-wmimethod\b.*\b(class|classname)\s*[:=]?\s*(win32_process)\b.*\b(name|methodname)\s*[:=]?\s*create\b"
+   or cmd matches regex @"(?i)\binvoke-cimmethod\b.*\b(win32_process)\b.*\b(create)\b")
+  and cmd matches regex @"(?i)\b(-computername|-cn|-session)\b"
+| extend Remote = coalesce(
+    extract(@"(?i)\b(-computername|-cn)\s+([^\s,;]+)",2,cmd),
+    extract(@"(?i)\b-computername\s*[:=]\s*([^\s,;]+)",1,cmd)
+  )
+| where isnotempty(Remote) and Remote !in~ ("localhost","127.0.0.1",".")
+| summarize
+    EventCount = count(),
+    Remotes    = make_set(Remote, 10),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents    = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount > 0
+| extend
+  Signal = "Remote Exec via PowerShell WMI/CIM (Win32_Process.Create)",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    "🚨 Remote process creation via Invoke-WmiMethod/Invoke-CimMethod\n",
+    "• Who: ", PrimaryAccount, " | Remote(s): ", strcat_array(Remotes, ", "), "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSigs, ", "), ")\n",
+    "• Commands: ", strcat_array(Commands, " | "), " | First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "📌 Direct use of WMI/CIM APIs to spawn remote processes is highly indicative of PowerShell-driven lateral movement."
+  );
+// 9️⃣ Remote Execution via PaExec
+let PaExec_RemoteExec =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| extend fn = tolower(FileName), cmd = tolower(ProcessCommandLine),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where fn =~ "paexec.exe" or cmd has " paexec "
+| extend Remote = extract(@"(?i)\bpaexec(?:\.exe)?\s+\\\\([^\s\\]+)",1,cmd)
+| summarize
+    EventCount = count(),
+    Remotes    = make_set(Remote, 10),
+    Commands   = make_set(strcat("[",ProcessCommandLine,"]"),5),
+    Parents    = make_set(Parent,5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount > 0
+| extend
+  Signal = "Remote Execution via PaExec",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    "🚨 PaExec (PsExec alternative) observed\n",
+    "• Who: ", PrimaryAccount, " | Remote(s): ", iff(array_length(Remotes)>0, strcat_array(Remotes, ", "), "n/a"), "\n",
+    "• Parent(s): ", strcat_array(Parents," | "), " (Signature: ", strcat_array(ParentSigs,", "), ")\n",
+    "• Commands: ", strcat_array(Commands," | "), " | First: ", format_datetime(FirstSeen,"yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "📌 PaExec is often chosen to bypass controls focused on PsExec; treat as confirmed lateral movement."
+  );
+// 🔟 Remote service operations via sc.exe 
+let SC_Remote_ServiceOps =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "sc.exe"
+| extend cmd = tolower(ProcessCommandLine),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| extend        Remote = tolower(extract(@"(?i)\bsc(\.exe)?\s+\\\\([^\s\\]+)", 2, cmd)),
+         Op     = tolower(extract(@"(?i)\bsc(\.exe)?\s+\\\\[^\s\\]+\s+(create|start|stop|config|delete)\b", 2, cmd)),
+         Service= tolower(extract(@"(?i)\bsc(\.exe)?\s+\\\\[^\s\\]+\s+(?:create|start|stop|config|delete)\s+([^\s]+)", 2, cmd)),
+         Bin    = extract(@"(?i)\bbinpath\s*=\s*""?([^""]+)""?", 1, cmd)
+| where isnotempty(Remote) and isnotempty(Op) and isnotempty(Service)
+| where Remote !in~ ("127.0.0.1","localhost",".")
+| extend IsWriteOp = Op in~ ("create","config","delete"),
+         IsHighRiskService = Service has_any (HighRiskSvcHints),
+         IsAllowedService  = Service has_any (AllowSvcHints),
+         BinSuspect = iif(isnotempty(Bin) and (tolower(Bin) has_any (dynamic(["\\appdata\\","\\programdata\\","\\users\\public\\","\\temp\\","http://","https://","\\\\"]))
+                       or tolower(Bin) matches regex @"(?i)\.(exe|dll|ps1|bat|cmd)\b"), true, false)
+| summarize
+    EventCount     = count(),
+    DistinctRemotes= dcount(Remote),
+    Ops            = make_set(Op, 10),
+    Remotes        = make_set(Remote, 50),
+    Services       = make_set(Service, 50),
+    AnyWriteOp     = any(IsWriteOp),
+    AnyHighRiskSvc = any(IsHighRiskService),
+    AnyAllowedSvc  = any(IsAllowedService),
+    AnyBinSus      = any(BinSuspect),
+    Binpaths       = make_set_if(Bin, isnotempty(Bin), 20),
+    Commands       = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Accounts       = make_set(AccountName),
+    Parents        = make_set(Parent, 5),
+    ParentSigs     = make_set(ParentSigned),
+    FirstSeen      = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+// keep: any write op; or start/stop on high-risk service; or suspicious binpath; ignore start/stop of allowlisted app services
+| where AnyWriteOp or AnyHighRiskSvc or AnyBinSus or (not(AnyAllowedSvc) and DistinctRemotes >= 3)
+| extend
+  Signal = iif(AnyWriteOp, "Remote Service WRITE via sc.exe",
+               iif(AnyHighRiskSvc or AnyBinSus, "Remote Service Control (High-Risk) via sc.exe",
+                   "Remote Service Control (Horizontal) via sc.exe")),
+  Severity = iif(AnyWriteOp or AnyBinSus, "🔴 High", "🟠 Medium"),
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    iif(AnyWriteOp, "🚨 Remote service WRITE operations (create/config/delete)", "⚠️ Remote service control (start/stop)"), "\n",
+    "• Who: ", PrimaryAccount, " | Remote(s): ", strcat_array(Remotes, ", "), "\n",
+    "• Op(s): ", strcat_array(Ops, ", "), " | Service(s): ", strcat_array(Services, ", "), "\n",
+    "• BinPath(s): ", iff(array_length(Binpaths)>0, strcat_array(Binpaths, " | "), "n/a"),
+      " | HighRiskSvc: ", tostring(AnyHighRiskSvc), " | AllowedSvc: ", tostring(AnyAllowedSvc), "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (", strcat_array(ParentSigs, ", "), ")\n",
+    "• Commands: ", strcat_array(Commands, " | "), " | First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "📌 Prioritizes create/config/delete and impactful start/stop, while suppressing known app-service maintenance activity."
+  );
+//11) SMB Admin$ payload staging (copy/xcopy/robocopy/PowerShell to ADMIN$/C$) — fixed (no lookahead)
+let SMB_AdminShare_PayloadStaging =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| extend cmd = tolower(ProcessCommandLine),
+         fn  = tolower(FileName),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+// Copy tools and PS copy patterns
+| where fn in~ ("cmd.exe","powershell.exe","pwsh.exe","xcopy.exe","robocopy.exe","copy.exe","move.exe")
+   or cmd has_any (" robocopy "," xcopy "," copy "," move "," copy-item "," new-psdrive ")
+// Extract remote admin share targets \\HOST\ADMIN$ or \\HOST\C$ ...
+| extend RemoteHost = extract(@"(?:^|[\s'""=])\\\\([a-z0-9\-\._$]+)\\(admin\$|[cdefgh]\$)\\", 1, cmd),
+         Share      = extract(@"(?:^|[\s'""=])\\\\([a-z0-9\-\._$]+)\\(admin\$|[cdefgh]\$)\\", 2, cmd)
+// Suspicion flags (sans lookahead)
+| extend SuspExt  = cmd matches regex @"(?i)\.(exe|dll|ps1|bat|cmd|vbs|js|jse|wsf|msi|scr)(?:$|[\s""'`;])",
+         SuspPath = cmd has_any ("\\appdata\\","\\programdata\\","\\users\\public\\","\\temp\\"),
+         HasUrlOrUnc = cmd has_any ("http://","https://","\\\\")
+| extend ShortDevice = tolower(extract(@"^[^.]+", 0, tostring(DeviceName)))
+| where isnotempty(RemoteHost) and RemoteHost !in~ ("localhost","127.0.0.1",".") and RemoteHost != ShortDevice  
+// Aggregate
+| summarize
+    EventCount      = count(),
+    DistinctRemotes = dcount(RemoteHost),
+    Remotes         = make_set(RemoteHost, 20),
+    Shares          = make_set(Share, 5),
+    Commands        = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents         = make_set(Parent, 5),
+    ParentSigs      = make_set(ParentSigned),
+    Accounts        = make_set(AccountName),
+    FirstSeen       = min(TimeGenerated),
+    AnySuspicious   = any(SuspExt or SuspPath or HasUrlOrUnc)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where DistinctRemotes >= 1
+| extend
+  Signal = "SMB Admin$ payload staging (copy/xcopy/robocopy)",
+  Severity = iff(AnySuspicious or DistinctRemotes >= 3, "🔴 High", "🟠 Medium"),
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    "🚨 Files copied to administrative shares (ADMIN$/C$) on remote hosts", "\n",
+    "• Who: ", PrimaryAccount, " | Remote(s): ", strcat_array(Remotes, ", "), " | Share(s): ", strcat_array(Shares, ", "), "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSigs, ", "), ")", "\n",
+    "• Commands (sample): ", strcat_array(Commands, " | "), "\n",
+    "• Events: ", tostring(EventCount), " | First: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")", "\n",
+    "📌 Context: Staging payloads via ADMIN$/C$ commonly precedes remote service/task creation and ransomware deployment."
+  );
+//12) Pass-the-Certificate tooling (PFX/PKINIT)
+let PassTheCert_Tooling =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| extend fn  = tolower(FileName),
+         cmd = tolower(ProcessCommandLine),
+         par = tostring(InitiatingProcessFileName),
+         sig = iff(InitiatingProcessSignatureStatus=="Valid","Signed","Unsigned/Unknown")
+| where
+  // Certipy PKINIT auth with PFX
+  (fn in ("certipy.exe","certipy2.exe") and cmd has " auth " and cmd has " -pfx ") or
+  // passthecert.py (python wrapper)
+  (fn in ("python.exe","py.exe") and cmd matches regex @"(?i)\\passthecert\.py(\s|$)") or
+  // Rubeus PKINIT with certificate
+  (fn == "rubeus.exe" and cmd matches regex @"(?i)\basktgt\b" and (cmd has "/certificate:" or cmd has "/pfx:")) or
+  // Kekeo PKINIT
+  (fn == "kekeo.exe" and cmd matches regex @"(?i)\btgt::ask\b" and (cmd has "/pfx" or cmd has "/tgtcert")) or
+  // Impacket / PKINITtools variants
+  (fn in ("python.exe","py.exe") and cmd matches regex @"(?i)\b(gettgtpkinit\.py|getnthash\.py)\b" and cmd has_any (" -cert "," -key "))
+| where sig != "Signed" or par in~ ("cmd.exe","powershell.exe","pwsh.exe") 
+| summarize
+    EventCount = count(),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Accounts   = make_set(AccountName, 5),
+    Parents    = make_set(par, 5),
+    Sigs       = make_set(sig, 3),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| extend
+  Signal = "Pass-the-Certificate tooling (PFX/PKINIT)",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+    "🚨 PKINIT/Pass-the-Certificate tooling observed", "\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (", strcat_array(Sigs, ", "), ")\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• First time seen: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Using a certificate keypair to obtain Kerberos tickets enables stealthy auth and lateral movement."
+  );
+// 🔄 Union
+let BaseAlerts =
+    union WMIC_RemoteExec,PsExec_RemoteExec,WmiPrvse_Spawn_Suspicious,Wsmprovhost_Spawn_Suspicious,WinRM_PowerShell_Client,Schtasks_Remote,PS_WMI_CIM_RemoteExec,PaExec_RemoteExec,SC_Remote_ServiceOps,RegistryRemoteOps_Tuned,SMB_AdminShare_PayloadStaging,PassTheCert_Tooling
+    | extend JoinKey = tolower(PrimaryAccount);
+let IdxIdentity =
+(
+    IdentityInfo
+    | where TimeGenerated > ago(90d)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN, AccountName, AccountDomain
+    | extend KeyCandidates = pack_array(
+        tolower(tostring(AccountUPN)),
+        tolower(tostring(AccountName)),
+        tolower(strcat(tostring(AccountDomain), "\\", tostring(AccountName))),
+        tolower(tostring(MailAddress))
+      )
+    | mv-expand Key = KeyCandidates to typeof(string)
+    | where isnotempty(Key)
+    | summarize UserFullName = any(AccountDisplayName) by Key
+);
+BaseAlerts
+| join kind=leftouter IdxIdentity on $left.JoinKey == $right.Key
+| extend UserFullName = tostring(coalesce(UserFullName, ""))
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, UserFullName, Signal, Severity, Summary
+
+
+
+
