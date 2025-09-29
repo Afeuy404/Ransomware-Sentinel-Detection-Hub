@@ -1,0 +1,702 @@
+let timeRange = 90d;
+let binSize   = 15m;
+// 1️⃣ Abusive use of runas.exe for manual elevation (fix: TimeWindow, DeviceName, dynamic likelihood)
+let IsUserWritableToken = (s: string) {
+    s has @"\AppData\" or s has @"\Temp\" or s has @"\Roaming\" or s has @"\Downloads\"
+};
+let IsScriptOrLolbin = (s: string) {
+    s matches regex @"(?i)\.(ps1|bat|cmd|vbs|js|psm1)\b" or
+    s has_any ("powershell", "cmd", "wscript", "cscript", "regsvr32", "mshta")
+};
+let RunAsAbuse_balanced =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName =~ "runas.exe"
+        or (FileName =~ "cmd.exe" and ProcessCommandLine matches regex @"(?i)\brunas(\.exe)?\b")
+        or (FileName =~ "powershell.exe" and ProcessCommandLine matches regex @"(?i)\bStart-Process\b.*-Verb\s+runAs")
+    | where ProcessCommandLine contains "/user:"
+        or (FileName =~ "powershell.exe" and ProcessCommandLine matches regex @"(?i)-Verb\s+runAs")
+    | where IsScriptOrLolbin(ProcessCommandLine) or IsUserWritableToken(ProcessCommandLine)
+    // exclusions consoles/admin et cas IT connus
+    | where InitiatingProcessSignatureStatus != "Valid" or InitiatingProcessVersionInfoCompanyName !~ "Microsoft"
+    | where not(ProcessCommandLine has_any ("mmc", "compmgmt.msc", "gpedit.msc", "services.msc", "eventvwr.msc", "cmdkey", "control.exe", "notepad.exe", "calc.exe", "ssms.exe", "devenv.exe", "outlook.exe"))
+    | where not(ProcessCommandLine has_any ("chocolatey.org", "wsl.exe --install"))
+    // agrégation + flags utiles pour le scoring
+    | summarize
+        EventCount = count(),
+        DistCmds   = dcount(ProcessCommandLine),
+        Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+        Accounts   = make_set(AccountName),
+        Parents    = make_set(InitiatingProcessFileName, 5),
+        ParentSignedAny = make_set(InitiatingProcessSignatureStatus),
+        FirstSeen  = min(TimeGenerated),
+        LastSeen   = max(TimeGenerated),
+        HasEncoded = any(ProcessCommandLine has "-EncodedCommand"),
+        HasHidden  = any(ProcessCommandLine has "-WindowStyle hidden"),
+        FromUserWritable = any(ProcessCommandLine has_any ("\\AppData\\", "\\Temp\\", "\\Roaming\\", "\\Downloads\\"))
+        by DeviceId, DeviceName, TimeWindow=bin(TimeGenerated, 1d)
+    // seuil: au moins 2 événements dans 24h
+    | where EventCount >= 2
+    | extend
+        Severity = "🟠 Medium",
+        Signal = "runas.exe Used for Privilege Escalation",
+        PrimaryAccount = tostring(Accounts[0]),
+        Summary = strcat(
+              "⚠️ Potential privilege escalation via runas / runAs verb\n",
+              "• Who: ",
+              strcat_array(Accounts, ", "),
+              "\n",
+              "• What: ",
+              tostring(EventCount),
+              " runas-like executions in 24h (",
+              tostring(DistCmds),
+              " distinct commands)\n",
+              "• Commands: ",
+              strcat_array(Commands, " | "),
+              "\n",
+              "• Parent(s): ",
+              strcat_array(Parents, " | "),
+              " (SignedAny: ",
+              strcat_array(ParentSignedAny, ", "),
+              ")\n",
+              "• When: ",
+              format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+              " → ",
+              format_datetime(LastSeen, "yyyy-MM-dd HH:mm:ss"),
+              "\n",
+              "• Device: ",DeviceId," (",DeviceName,")\n",
+              "🛑 runas / Start-Process -Verb runAs allow for privilege escalation and are often abused post-compromise.");
+// 2️⃣ UAC bypass native LOLBins like fodhelper.exe (fix: DeviceName + dynamic likelihood)
+let UACBypassViaLOLbins =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName in~ ("fodhelper.exe", "eventvwr.exe", "sdclt.exe", "computerdefaults.exe")
+    // FP connus
+    | where not (FileName =~ "fodhelper.exe" and ProcessCommandLine has "-Embedding" and InitiatingProcessFileName == "svchost.exe")
+    // Exclure Event Viewer “propre”
+    | where not (FileName =~ "eventvwr.exe" and InitiatingProcessFileName =~ "explorer.exe" and (strlen(trim(@" ", ProcessCommandLine)) <= 18))
+    | where not (FileName =~ "eventvwr.exe" and ProcessCommandLine matches regex @"(?i)/l:"".*\.evtx""" and InitiatingProcessSignatureStatus == "Valid")
+    | where not (FileName =~ "eventvwr.exe" and ProcessCommandLine matches regex @"(?i)/v:"".*\\appdata\\.*\\devmgr\.xml""" and InitiatingProcessFileName in~ ("explorer.exe", "mmc.exe") and InitiatingProcessSignatureStatus == "Valid")
+    | extend 
+        IsSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Yes", "No"),
+        FolderPath = tostring(FolderPath),
+        Initiator = tostring(InitiatingProcessFileName),
+        IsUserWritableArg = ProcessCommandLine has_any ("\\AppData\\", "\\Temp\\", "\\Roaming\\", "\\Downloads\\"),
+        IsNonMicrosoftParent = InitiatingProcessSignatureStatus != "Valid" or InitiatingProcessVersionInfoCompanyName !~ "Microsoft"
+    | summarize 
+        EventCount = count(),
+        Commands = make_set(strcat("[", ProcessCommandLine, "]"), 3),
+        Users = make_set(AccountName),
+        LOLBins = make_set(FileName),
+        Parents = make_set(Initiator, 5),
+        SignedParents = make_set(IsSigned),
+        Folders = make_set(FolderPath, 3),
+        FirstSeen = min(TimeGenerated),
+        LastSeen  = max(TimeGenerated),
+        AnyUserWritable = any(IsUserWritableArg),
+        AnyNonMsParent  = any(IsNonMicrosoftParent)
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+    | where EventCount > 0
+    | extend 
+        Severity = "🟠 Medium",
+        Signal = "UAC Bypass via LOLBins",
+        PrimaryAccount = tostring(Users[0]),
+        Summary = strcat(
+              "🚨 UAC Bypass Attempt Detected via LOLBins\n",
+              "• Who: ",
+              strcat_array(Users, ", "),
+              "\n",
+              "• Binaries: ",
+              strcat_array(LOLBins, ", "),
+              "\n",
+              "• Commands: ",
+              strcat_array(Commands, " | "),
+              "\n",
+              "• Parent(s): ",
+              strcat_array(Parents, " | "),
+              " (Signed: ",
+              strcat_array(SignedParents, ", "),
+              ")\n",
+              "• Folder(s): ",
+              strcat_array(Folders, " | "),
+              "\n",
+              "• When: ",
+              format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+              " → ",
+              format_datetime(LastSeen, "yyyy-MM-dd HH:mm:ss"),
+              "\n",
+              "• Device: ",
+              DeviceId,
+              " (",
+              DeviceName,
+              ")\n",
+              "🛑 These built-in Windows binaries are often abused in UAC bypass chains."
+          );
+// 3️⃣ Privilege escalation via local admin group manipulation (fix: DeviceName + dynamic likelihood)
+let PrivEscViaLocalGroup =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName in~ ("powershell.exe", "net.exe", "net1.exe")
+    | where ProcessCommandLine has_all ("administrators", "add")
+        or ProcessCommandLine has "Add-LocalGroupMember"
+    // flags pour scoring
+    | extend Parent=InitiatingProcessFileName, ParentSigned=InitiatingProcessSignatureStatus
+    | summarize 
+        EventCount = count(),
+        Commands = make_set(strcat("[", ProcessCommandLine, "]"), 3),
+        Users = make_set(AccountName),
+        Parents = make_set(Parent, 5),
+        ParentSignedAny = make_set(ParentSigned),
+        FirstSeen = min(TimeGenerated),
+        LastSeen  = max(TimeGenerated)
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+    | where EventCount > 0
+    | extend 
+        Severity = "🔴 High",
+        Signal = "Privilege Escalation via Local Admin Group",
+        PrimaryAccount = tostring(Users[0]),
+        Summary = strcat(
+              "🚨 Local group membership change detected\n",
+              "• Who: ",
+              strcat_array(Users, ", "),
+              "\n",
+              "• Commands: ",
+              strcat_array(Commands, " | "),
+              "\n",
+              "• Parent(s): ",
+              strcat_array(Parents, " | "),
+              " (SignedAny: ",
+              strcat_array(ParentSignedAny, ", "),
+              ")\n",
+              "• When: ",
+              format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+              " → ",
+              format_datetime(LastSeen, "yyyy-MM-dd HH:mm:ss"),
+              "\n",
+              "• Device: ",
+              DeviceId,
+              " (",
+              DeviceName,
+              ")\n",
+              "🛑 Attackers often add backdoor accounts into the Administrators group to maintain privileged access."
+          );
+// 4️⃣ PowerShell UAC bypass tools (Invoke-BypassUAC / Start-Process -Verb RunAs)
+let PowerShellUACBypass =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName in~ ("powershell.exe", "pwsh.exe")
+    | extend LowerCmd = tolower(ProcessCommandLine)
+    // Garder les patterns UAC suspects
+    | where
+        // A) UAC bypass explicite ou runAs
+        (LowerCmd matches regex @"(?i)\binvoke-[a-z0-9]+uac\b"
+        or (LowerCmd contains "bypassuac" and LowerCmd contains "invoke")
+        or (LowerCmd has "start-process" and LowerCmd has "-verb runas"))
+        // B) + Indicateurs d'abus (au moins un)
+        and (LowerCmd has "-encodedcommand"
+        or LowerCmd has_any ("\\appdata\\", "\\temp\\", "\\downloads\\", " iex ", " iwr ", " irm ", " downloadstring"))
+    // Exclure usages légitimes connus
+    | where not(LowerCmd has_any ("chocolatey.org", " choco ", "winget", "nodejs\\install_tools.bat", "balena_etcher", "balenaetcher", "visualstudio", "vs_buildtools"))
+    // Renforcer le signal par le parent
+    | where InitiatingProcessSignatureStatus != "Valid"
+        or InitiatingProcessVersionInfoCompanyName !~ "Microsoft"
+        or InitiatingProcessFileName in~ ("cmd.exe", "wscript.exe", "cscript.exe")
+    // Agrégation (style main query)
+    | summarize
+        EventCount = count(),
+        Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+        Users      = make_set(AccountName),
+        Parent     = tostring(max(InitiatingProcessFileName)),
+        ParentSigned = tostring(max(InitiatingProcessSignatureStatus)),
+        FirstSeen  = min(TimeGenerated)
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+    | where EventCount > 0
+    | extend
+        Signal = "PowerShell UAC Bypass Script Detected",
+        Severity = "🟠 Medium",
+        PrimaryAccount = tostring(Users[0]),
+        Summary = strcat(
+              "🚨 PowerShell UAC bypass attempt detected\n",
+              "• Who: ",
+              strcat_array(Users, ", "),
+              "\n",
+              "• What: ",
+              tostring(EventCount),
+              " PowerShell runAs/UAC-bypass pattern(s)\n",
+              "• Command(s): ",
+              strcat_array(Commands, " | "),
+              "\n",
+              "• Parent: ",
+              Parent,
+              " (Signed: ",
+              ParentSigned,
+              ")" "\n",
+              "• When: ",
+              format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+              "\n",
+              "• Device: ",
+              DeviceId,
+              " (",
+              DeviceName,
+              ")\n",
+              "🛑 Invoke-*-UAC / Start-Process -Verb RunAs are frequently used to bypass UAC and run with elevated privileges."
+          );
+//5️⃣ Credential Dumping Indicators (LSASS / Mimikatz / comsvcs.dll)
+let CredentialDumpingIndicators =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    // 1) procdump ciblant LSASS avec options de dump complètes
+    | where (FileName =~ "procdump.exe"
+        and ProcessCommandLine has_any (" -ma ", " -mm ", " -r ", " -o ")
+        and ProcessCommandLine contains "lsass")
+        // 2) rundll32 -> comsvcs.dll, MiniDump (classique LSASS dump)
+        or (FileName =~ "rundll32.exe"
+        and ProcessCommandLine matches regex @"(?i)\bcomsvcs\.dll\s*,\s*MiniDump\b")
+        // 3) signatures Mimikatz / sekurlsa via PS/cmd (même si binaire renommé)
+        or (FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+        and ProcessCommandLine matches regex @"(?i)(invoke-?mimikatz|sekurlsa::|privilege::debug|DumpCreds)")
+        // 4) nom explicite “mimikatz” si jamais présent
+        or (FileName matches regex @"(?i)mimikatz(\.exe)?$")
+    | extend
+        Parent       = tostring(InitiatingProcessFileName),
+        ParentSigned = tostring(InitiatingProcessSignatureStatus)
+    | summarize
+        EventCount = count(),
+        Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+        Users      = make_set(AccountName),
+        Parents    = make_set(Parent, 5),
+        ParentSigned = make_set(Parent, 5),
+        FirstSeen  = min(TimeGenerated)
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+    | where EventCount > 0
+    | extend
+        Signal = "Credential Dumping Indicators (LSASS/Mimikatz)",
+        Severity = "🔴 High",
+        PrimaryAccount = tostring(Users[0]),
+        Summary = strcat(
+              "🚨 Possible credential dumping activity\n",
+              "• Who: ",
+              strcat_array(Users, ", "),
+              "\n",
+              "• What: ",
+              tostring(EventCount),
+              " indicator(s) of LSASS/Mimikatz dump (procdump, comsvcs.dll, sekurlsa)\n",
+              "• Commands: ",
+              strcat_array(Commands, " | "),
+              "\n",
+              "• Parent(s): ",
+              strcat_array(Parents, " | "),
+              " (Signed: ",
+              ParentSigned,
+              ")\n",
+              "• When: ",
+              format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+              "\n",
+              "• Device: ",
+              DeviceId,
+              " (",
+              DeviceName,
+              ")\n",
+              "🛑 Dumping LSASS or invoking Mimikatz is a strong credential-theft indicator."
+          );
+// 6️⃣ CMSTP UAC Bypass (INF silencieux depuis chemins user-writable / URL)
+let CmstpUACBypass =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName =~ "cmstp.exe"
+    | where ProcessCommandLine has_any ("/s", "/ni", "/ns")
+        and ProcessCommandLine matches regex @"(?i)\.inf(\s|$|""|\')"
+        and (ProcessCommandLine has @"\AppData\" or ProcessCommandLine has @"\Temp\" or ProcessCommandLine has "http://" or ProcessCommandLine has "https://")
+    | extend
+        Parent=tostring(InitiatingProcessFileName),
+        ParentSigned=tostring(InitiatingProcessSignatureStatus)
+    | summarize
+        EventCount=count(),
+        Commands=make_set(strcat("[", ProcessCommandLine, "]"), 5),
+        Users=make_set(AccountName),
+        FirstSeen=min(TimeGenerated),
+        Parent=tostring(max(Parent)),
+        ParentSigned=tostring(max(ParentSigned))
+        by DeviceId, DeviceName, TimeWindow=bin(TimeGenerated, binSize)
+    | where EventCount > 0
+    | extend
+        Signal="CMSTP UAC Bypass",
+        Severity="🔴 High",
+        PrimaryAccount=tostring(Users[0]),
+        Summary=strcat(
+            "🚨 cmstp.exe used with silent flags and INF from user-writable/remote path\n",
+            "• Who: ",
+            strcat_array(Users, ", "),
+            "\n",
+            "• Commands: ",
+            strcat_array(Commands, " | "),
+            "\n",
+            "• Parent: ",
+            Parent,
+            " (Signed: ",
+            ParentSigned,
+            ")\n",
+            "• When: ",
+            format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+            "\n",
+            "• Device: ",
+            DeviceId,
+            " (",
+            DeviceName,
+            ")\n",
+            "🛑 cmstp with external INF allows UAC bypass and elevated execution."
+        );
+// 7️⃣ UAC Settings Tampering (EnableLUA / ConsentPrompt / Secure Desktop)
+let UACSettingsTamper =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName =~ "reg.exe" and ProcessCommandLine has " add "
+    | where ProcessCommandLine matches regex @"(?i)\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\(EnableLUA|ConsentPromptBehaviorAdmin|PromptOnSecureDesktop)"
+    | where ProcessCommandLine has_any (" /d ", " /v ")
+    | extend
+        Parent=tostring(InitiatingProcessFileName),
+        ParentSigned=tostring(InitiatingProcessSignatureStatus)
+    | summarize
+        EventCount=count(),
+        Commands=make_set(strcat("[", ProcessCommandLine, "]"), 5),
+        Users=make_set(AccountName),
+        FirstSeen=min(TimeGenerated),
+        Parent=tostring(max(Parent)),
+        ParentSigned=tostring(max(ParentSigned))
+        by DeviceId, DeviceName, TimeWindow=bin(TimeGenerated, binSize)
+    | where EventCount > 0
+    | extend
+        Signal="UAC Settings Tampering (reg.exe)",
+        Severity="🔴 High",
+        PrimaryAccount=tostring(Users[0]),
+        Summary=strcat(
+            "🚨 reg.exe modifying UAC-related policy keys (EnableLUA/ConsentPrompt)\n",
+            "• Who: ",
+            strcat_array(Users, ", "),
+            "\n",
+            "• Commands: ",
+            strcat_array(Commands, " | "),
+            "\n",
+            "• Parent: ",
+            Parent,
+            " (Signed: ",
+            ParentSigned,
+            ")\n",
+            "• When: ",
+            format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+            "\n",
+            "• Device: ",
+            DeviceId,
+            " (",
+            DeviceName,
+            ")\n",
+            "🛑 Changing UAC reduces prompts and makes silent elevation easier."
+        );
+// 8️⃣ Odbcconf LOLBin Elevation (/A {…} depuis user-writable)
+let OdbcconfElevation =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName =~ "odbcconf.exe"
+    | where ProcessCommandLine has "/A"
+        and ProcessCommandLine matches regex @"(?i)\{.*\}"
+        and (ProcessCommandLine has @"\AppData\" or ProcessCommandLine has @"\Temp\" or ProcessCommandLine has @"\downloads\" or ProcessCommandLine matches regex @"(?i)\.(dll|rsp|ini|txt)(\s|$|""|\')")
+    | extend
+        Parent=tostring(InitiatingProcessFileName),
+        ParentSigned=tostring(InitiatingProcessSignatureStatus)
+    | summarize
+        EventCount=count(),
+        Commands=make_set(strcat("[", ProcessCommandLine, "]"), 5),
+        Users=make_set(AccountName),
+        FirstSeen=min(TimeGenerated),
+        Parent=tostring(max(Parent)),
+        ParentSigned=tostring(max(ParentSigned))
+        by DeviceId, DeviceName, TimeWindow=bin(TimeGenerated, binSize)
+    | where EventCount > 0
+    | extend SuspiciousOdbc = Commands has_any("\\appdata\\","\\temp\\","\\downloads\\") or Commands matches regex @"(?i)\.(dll|ini|rsp)\b"
+    | extend Severity = case(SuspiciousOdbc and ParentSigned != "Valid", "🔴 High", "🟠 Medium")
+    | extend
+        Signal="Odbcconf LOLBin Elevation",
+        Severity="🟠 Medium",
+        PrimaryAccount=tostring(Users[0]),
+        Summary=strcat(
+            "⚠️ odbcconf.exe used to register DLL / config from user-writable path\n",
+            "• Who: ",
+            strcat_array(Users, ", "),
+            "\n",
+            "• Commands: ",
+            strcat_array(Commands, " | "),
+            "\n",
+            "• Parent: ",
+            Parent,
+            " (Signed: ",
+            ParentSigned,
+            ")\n",
+            "• When: ",
+            format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+            "\n",
+            "• Device: ",
+            DeviceId,
+            " (",
+            DeviceName,
+            ")\n",
+            "🛑 odbcconf can perform loads via /A {…} with elevation in certain contexts."
+        );
+// 9️⃣ Built-in Administrator Enabled / Password Set (corrigé sans lookahead)
+let BuiltInAdminEnabledOrPasswordSet =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName in~ ("net.exe", "net1.exe", "powershell.exe", "pwsh.exe")
+    // Motifs explicites (Net & PowerShell), exclusions gérées via where not
+    | where
+        // --- NET.EXE patterns ---
+        (FileName in~ ("net.exe", "net1.exe")
+        and (
+        // Activation du compte intégré
+        ProcessCommandLine matches regex @"(?i)\bnet(\.exe)?\s+user\s+(administrator)\s+/active\s*:\s*yes\b"
+        or // Réinitialisation du mot de passe (un 3e token après le nom) – on exclut ensuite /domain et /delete
+        ProcessCommandLine matches regex @"(?i)\bnet(\.exe)?\s+user\s+(administrator)\s+\S+"
+        or // Création d’un compte local
+        ProcessCommandLine matches regex @"(?i)\bnet(\.exe)?\s+user\s+/add\s+\S+"
+        )
+        )
+        or
+        // --- PowerShell patterns ---
+        (FileName in~ ("powershell.exe", "pwsh.exe")
+        and (
+        // Enable/Set-LocalUser sur Administrator/Administrateur
+        ProcessCommandLine matches regex @"(?i)\b(Enable-LocalUser|Set-LocalUser)\b.*(administrator|administrateur)"
+        or // Set-LocalUser avec changement de mot de passe
+        ProcessCommandLine matches regex @"(?i)\bSet-LocalUser\b.*\b(AccountPassword|Password)\b"
+        )
+        )
+    // Exclusions NET explicites (pas de lookahead, on filtre ici)
+    | where not(ProcessCommandLine has_any ("/domain", "/delete"))
+    // Drapeaux pour scoring
+    | extend
+        Parent          = tostring(InitiatingProcessFileName),
+        ParentSigned    = tostring(InitiatingProcessSignatureStatus),
+        IsActivationNet = iff(ProcessCommandLine matches regex @"(?i)\bnet(\.exe)?\s+user\s+(administrator|administrateur)\s+/active\s*:\s*yes\b", true, false),
+        IsPassNet       = iff(FileName in~ ("net.exe", "net1.exe") and ProcessCommandLine matches regex @"(?i)\bnet(\.exe)?\s+user\s+(administrator|administrateur)\s+\S+", true, false),
+        IsAddNet        = iff(FileName in~ ("net.exe", "net1.exe") and ProcessCommandLine matches regex @"(?i)\bnet(\.exe)?\s+user\s+/add\s+\S+", true, false),
+        IsPSAdmin       = iff(FileName in~ ("powershell.exe", "pwsh.exe") and ProcessCommandLine matches regex @"(?i)\b(Enable-LocalUser|Set-LocalUser)\b.*(administrator|administrateur)", true, false),
+        IsPSPass        = iff(FileName in~ ("powershell.exe", "pwsh.exe") and ProcessCommandLine matches regex @"(?i)\bSet-LocalUser\b.*\b(AccountPassword|Password)\b", true, false)
+    | summarize
+        EventCount     = count(),
+        Commands       = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+        Users          = make_set(AccountName),
+        Parents        = make_set(Parent, 5),
+        ParentSignedAny= make_set(ParentSigned),
+        FirstSeen      = min(TimeGenerated),
+        LastSeen       = max(TimeGenerated),
+        AnyActivation  = any(IsActivationNet or IsPSAdmin),
+        AnyPwdChange   = any(IsPassNet or IsPSPass),
+        AnyAccountAdd  = any(IsAddNet)
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+    | where EventCount > 0
+    | extend
+        Signal = "Built-in Administrator Enabled / Password Set",
+        Severity = "🟠 Medium",
+        PrimaryAccount = tostring(Users[0]),
+        Summary = strcat(
+              "🚨 Built-in/local admin account manipulation detected\n",
+              "• Who: ",
+              strcat_array(Users, ", "),
+              "\n",
+              "• What: ",
+              tostring(EventCount),
+              " change(s) to local admin accounts (enable/reset/add)\n",
+              "• Commands: ",
+              strcat_array(Commands, " | "),
+              "\n",
+              "• Parent(s): ",
+              strcat_array(Parents, " | "),
+              " (SignedAny: ",
+              strcat_array(ParentSignedAny, ", "),
+              ")\n",
+              "• When: ",
+              format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+              " → ",
+              format_datetime(LastSeen, "yyyy-MM-dd HH:mm:ss"),
+              "\n",
+              "• Device: ",
+              DeviceId,
+              " (",
+              DeviceName,
+              ")\n",
+              "🛑 Enabling/resetting the built-in Administrator account is a common TTP to maintain persistent privileged access."
+          );
+// 🔟 Shadow-credentials tool executed
+let IsUserWritable = (s: string) { tolower(s) has_any (dynamic(["\\downloads\\", "\\appdata\\", "\\temp\\", "\\roaming\\", "\\users\\public\\", "\\programdata\\"])) };
+let ShadowCredentialsTool_Detection =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where IsUserWritable(coalesce(FolderPath, "")) or IsUserWritable(ProcessCommandLine)
+    | where ProcessCommandLine has_any("shadow-credentials", "shadowcredentials", "shadowcreds", "msds-keycredentiallink", "keycredentiallink", "keycredential", "whisker")
+    | extend
+        cmd = tolower(ProcessCommandLine),
+        procTime = TimeGenerated,
+        PrimaryAccount = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName, AccountName)
+    | extend
+        ProcFile = tostring(FileName),
+        ProcPath = tostring(FolderPath),
+        ProcSigner = iff(InitiatingProcessSignatureStatus == "Valid", "Signed", "Unsigned")
+    | summarize
+        Count = count(),
+        Users = make_set(AccountName),
+        SampleCmds = make_set(strcat("[", ProcessCommandLine, "]"), 6),
+        Parents = make_set(tostring(InitiatingProcessFileName), 4),
+        Signatures = make_set(ProcSigner, 2),
+        FirstSeen = min(procTime),
+        LastSeen = max(procTime)
+        by DeviceId, DeviceName, PrimaryAccount, ProcFile, ProcPath
+    | extend
+        TimeWindow = bin(FirstSeen, binSize),
+        Severity = "🔴 High",
+        Signal = "Shadow-credentials tool executed",
+        PrimaryAccount = tostring(Users[0])
+    | extend Summary = strcat(
+                           "🚨 Suspicious shadow-credentials tool execution detected\n",
+                           "• Who: ",
+                           tostring(PrimaryAccount),
+                           "\n",
+                           "• Process: ",
+                           ProcFile,
+                           " (path: ",
+                           ProcPath,
+                           ")\n",
+                           "• Commands (sample): ",
+                           strcat_array(SampleCmds, " | "),
+                           "\n",
+                           "• Parent(s): ",
+                           strcat_array(Parents, " | "),
+                           " (Signer: ",
+                           strcat_array(Signatures, ", "),
+                           ")\n",
+                           "• When: ",
+                           format_datetime(FirstSeen, 'yyyy-MM-dd HH:mm:ss'),
+                           "\n",
+                           "• Device: ",
+                           DeviceId,
+                           " (",
+                           DeviceName,
+                           ")\n",
+                           "🛑 Shadow Credentials abuse lets an adversary authenticate as a user/service account without knowing the password, enabling privilege escalation and durable persistence."
+                       );
+//11) local account created
+let LocalAccountCreate =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | extend fn = tolower(FileName), cmd = tolower(ProcessCommandLine)
+    | where
+        // net / net1 (with or without password, allow quoted)
+        ((fn in ("net.exe", "net1.exe")
+        and cmd matches regex @"(?i)\bnet(\.exe|1\.exe)?\s+user\s+(""[^""]+""|\S+)(\s+(""[^""]+""|\S+))?\s+/add\b"
+        and cmd !has "/domain"))
+        // PowerShell local user creation
+        or (fn in ("powershell.exe", "pwsh.exe")
+        and (cmd has "new-localuser" or cmd matches regex @"(?i)\bnet\s+user\s+[^/]+\s+/add\b"))
+    | extend IsParentSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Signed", "Unsigned/Unknown")
+    | summarize
+        EventCount = count(),
+        Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+        Accounts   = make_set(AccountName),
+        Parents    = make_set(InitiatingProcessFileName, 5),
+        ParentSigs = make_set(IsParentSigned, 3),
+        FirstSeen  = min(TimeGenerated)
+        by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+    | extend
+        Signal="Local account created (net/net1/PowerShell)",
+        Severity = "🔴 High",
+        PrimaryAccount = tostring(Accounts[0]),
+        Summary = strcat(
+              "🚨 Local account creation- via net/net1\n",
+              "• Who: ",
+              strcat_array(Accounts, ", "),
+              "\n",
+              "• Commands: ",
+              strcat_array(Commands, " | "),
+              "\n",
+              "• Parent(s): ",
+              strcat_array(Parents, " | "),
+              " (",
+              strcat_array(ParentSigs, ", "),
+              ")\n",
+              "• First: ",
+              format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+              "\n",
+              "• Device: ",
+              DeviceId,
+              " (",
+              DeviceName,
+              ")\n",
+              "🛑 Attackers create local users for persistence and fallback access; check for admin-group adds and remote logons."
+          );
+//12)AD CS abuse via Certipy (request/auth/shadow/enum)
+let Certipy_ADCS =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | extend
+        fn = tolower(FileName),
+        cmd = tolower(ProcessCommandLine),
+        parent = tostring(InitiatingProcessFileName),
+        parentSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Signed", "Unsigned")
+    | where (fn in ("certipy.exe", "certipy2.exe", "python.exe"))
+        and cmd has "certipy"
+        and cmd matches regex @"\b(req|auth|find|shadow|adcs)\b"
+    | extend HasAbuseFlags = cmd has_any (dynamic([
+        " -ca ", " -template ", " -pfx ", " -hashes ", " -target ", " -upn ",
+        " -dc-ip ", " -username ", " -password ", " -kerberos "]))
+    | where parentSigned != "Signed" or parent !has_cs "microsoft"
+    | summarize
+        EventCount = count(),
+        Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+        Accounts   = make_set(AccountName, 5),
+        Parents    = make_set(parent, 5),
+        ParentSigs = make_set(parentSigned, 2),
+        FirstSeen  = min(TimeGenerated)
+        by DeviceId, DeviceName, HasAbuseFlags, TimeWindow = bin(TimeGenerated, binSize)
+    | extend
+        Signal = iif(HasAbuseFlags, "AD CS abuse via Certipy (request/auth/shadow)", "AD CS enumeration via Certipy"),
+        Severity = iif(HasAbuseFlags, "🔴 High", "🟠 Medium"),
+        PrimaryAccount = tostring(Accounts[0])
+    | extend Summary = strcat(
+                           "🚨 Certipy activity targeting AD CS\n",
+                           "• Who: ",
+                           PrimaryAccount,
+                           "\n",
+                           "• Parent(s): ",
+                           strcat_array(Parents, " | "),
+                           " (",
+                           strcat_array(ParentSigs, ", "),
+                           ")\n",
+                           "• Commands: ",
+                           strcat_array(Commands, " | "),
+                           "\n",
+                           "• Abuse flags present: ",
+                           tostring(HasAbuseFlags),
+                           "\n",
+                           "• First: ",
+                           format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"),
+                           "\n",
+                           "• Device: ",
+                           DeviceId,
+                           " (",
+                           DeviceName,
+                           ")\n",
+                           "🛑 Certipy can enumerate and exploit vulnerable AD CS templates (ESC*), enabling certificate-based impersonation."
+                       );
+// 🔄 Union
+let BaseAlerts =
+    union RunAsAbuse_balanced,UACBypassViaLOLbins,PrivEscViaLocalGroup,PowerShellUACBypass,CredentialDumpingIndicators,CmstpUACBypass,UACSettingsTamper,OdbcconfElevation,BuiltInAdminEnabledOrPasswordSet,ShadowCredentialsTool_Detection,LocalAccountCreate,Certipy_ADCS
+    | project TimeWindow, DeviceId, DeviceName, PrimaryAccount, Signal, Severity, Summary
+    | extend JoinKey = tolower(PrimaryAccount);
+let IdxIdentity =
+(
+    IdentityInfo
+    | where TimeGenerated > ago(90d)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN, AccountName, AccountDomain
+    | extend KeyCandidates = pack_array(
+        tolower(tostring(AccountUPN)),
+        tolower(tostring(AccountName)),
+        tolower(strcat(tostring(AccountDomain), "\\", tostring(AccountName))),
+        
