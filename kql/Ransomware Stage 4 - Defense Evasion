@@ -1,0 +1,484 @@
+let timeRange = 90d;
+let binSize = 15m;
+// 1️⃣ Use of taskkill.exe against AV/backup/db processes
+let HighRiskKillTokens = dynamic([  
+// AV / EDR
+  "msmpeng.exe","mpcmdrun.exe","nissrv.exe","mssense.exe","senseir.exe","sensece.exe",
+  "csfalconservice.exe","csfalconcontainer.exe","csagent.exe",
+  "sentinelagent.exe","sentinelservicehost.exe","sentinelhelperservice.exe","parity.exe","repux.exe","cbdefensewsc.exe",
+  "ccsvchst.exe","rtvscan.exe","smc.exe","avp.exe","ksde.exe","tmlisten.exe","ntrtscan.exe",
+  "savservice.exe","sophosfilescanner.exe","sophosfs.exe","hmpalert.exe","mfemms.exe","mcshield.exe","masvc.exe",
+  "mfevtps.exe","ekrn.exe","bdservicehost.exe","epsecurityservice.exe","cylancesvc.exe",
+// Backup/DR
+  "veeamagent.exe","veeam.endpoint.service.exe","veeamdeploymentsvc.exe",
+  "trueimageservice.exe","acronisagentservice.exe","acronisactiveprotectionservice.exe",
+  "cvd.exe","cvfwd.exe","bpbkar32.exe","bpcd.exe","nbdisco.exe",
+  "beremote.exe","bengine.exe","bemgr.exe","arcserveudpservice.exe",
+// DB & Windows backup
+  "sqlservr.exe","sqlbrowser.exe","sqlwriter.exe","mysqld.exe","mariadbd.exe","postgres.exe",
+  "pg_ctl.exe","oracle.exe","tnslsnr.exe","vssvc.exe","wbengine.exe"]);
+let norm = (s:string) { trim(' ', tolower(tostring(s))) };
+let ExcessiveTaskkill_Strict =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "taskkill.exe"
+| extend Acc = norm(AccountName), InitAcc = norm(InitiatingProcessAccountName)
+// Exclure les lignes qui ne font QUE du /PID
+| where not(ProcessCommandLine matches regex @"(?i)^\s*taskkill(\.exe)?\s+(/t\s+)?/f(\s+/t)?\s+/pid\s+\d+(\s|$)")
+// Garder /F + (/IM ou *.exe) et au moins un token sensible
+| where ProcessCommandLine has "/F" and (ProcessCommandLine has "/IM" or ProcessCommandLine matches regex @"(?i)\b\w+\.exe\b")
+  and ProcessCommandLine has_any (HighRiskKillTokens)
+| extend Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Yes", "No")
+| summarize
+    BurstCount = count(),
+    DistCmds   = dcount(ProcessCommandLine),
+    SampleCmds = make_set(strcat("[", ProcessCommandLine, "]"), 10),
+    Accounts   = make_set(AccountName),
+    Parents    = make_set(Parent, 5),
+    ParentSignatures = make_set(ParentSigned),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where BurstCount >= 1
+| extend
+  Signal = "Excessive use of taskkill.exe (targeted)",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0]),
+  Summary = strcat(
+    "🚨 Excessive taskkill activity against AV/backup/db processes\n",
+    "• Who: ", strcat_array(Accounts, ", "), "\n",
+    "• Commands: ", strcat_array(SampleCmds, " | "), "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signed: ", strcat_array(ParentSignatures, ", "), ")\n",
+    "• Count (", tostring(binSize), " burst): ", tostring(BurstCount), " (", tostring(DistCmds), " distinct)\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Typical Defense Evasion/Ransomware Pattern (kill AV/backup)."
+  );
+// 2️⃣ Repeated net stop usage
+let RepeatedNetStop =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where tolower(FileName) == "net.exe" or ProcessCommandLine has " net "
+    | where ProcessCommandLine has " stop "
+    | summarize 
+        NetStopCount = dcount(ProcessCommandLine),
+        NetStopCommands = make_set(strcat("[", ProcessCommandLine, "]"), 10),
+        FirstSeen = min(TimeGenerated),
+        Accounts = make_set(AccountName),
+        TimeWindow = bin(min(TimeGenerated), binSize)
+        by DeviceId
+    | where NetStopCount > 1
+    | extend 
+        Signal = "Repeated use of net stop",
+        Severity = "🟠 Medium",
+        PrimaryAccount = tostring(Accounts[0]),
+        Summary = strcat(
+            "⚠️ Repeated use of 'net stop' detected\n",
+            "• Who: ", strcat_array(Accounts, ", "), "\n",
+            "• Commands: ", strcat_array(NetStopCommands, " | "), "\n",
+            "• Count: ", tostring(NetStopCount), "\n",
+            "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+            "• Device: ", DeviceId, "\n",
+            "🛑 'net stop' is often abused to stop backup, AV, or recovery services."
+        );
+// 3️⃣ Services disabled via sc config
+let HighRiskScTargets = dynamic([
+  "winmgmt","pangps","windefend","sense","wdnissvc","mbamservice","savservice","sepmastersvc","sentinelagent","csagent",
+  "csfalconservice","cylancesvc","veeamagent","veeam.endpoint.service","sqlwriter","sqlservr","vss","wbengine"]);
+let ServicesDisabledSC =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where ProcessCommandLine has_all ("sc", "config", "disabled")
+    | extend cmd = tolower(ProcessCommandLine)
+    | extend ScTarget = tolower(extract(@"(?i)sc(\.exe)?\s+config\s+""?([^""\s]+)""?", 2, cmd))
+    | where not(ScTarget in~ ("ccmexec","wwan firmware flash service","wwan","fbwwanfilterservice","thingsmatrixagentservice"))
+    | extend HighRiskFlag = ScTarget in~ (HighRiskScTargets)
+    | summarize 
+        ScDisableCount = count(),
+        DistServices     = dcount(ScTarget),
+        ServicesList      = make_set(ScTarget, 50),
+        DisabledServices = make_set(strcat("[", ProcessCommandLine, "]"), 10),
+        FirstSeen = min(TimeGenerated),
+        Accounts = make_set(AccountName),
+        Parents= make_set(InitiatingProcessFileName, 5),
+        HighRiskHit= any(HighRiskFlag),
+        HighRiskServices  = make_set_if(ScTarget, HighRiskFlag, 50),
+        TimeWindow = bin(min(TimeGenerated), binSize)
+        by DeviceId
+    | where (HighRiskHit and ScDisableCount >= 1)
+        or (not(HighRiskHit) and DistServices >= 3)
+    | extend 
+        Signal = "Services disabled using sc config",
+        Severity = iff(HighRiskHit, "🔴 High", "🟠 Medium"),
+        PrimaryAccount = tostring(Accounts[0]),
+        Summary = strcat(
+            "🚨 Services disabled via sc config\n",
+            "• Who: ", strcat_array(Accounts, ", "), "\n",
+            "• Commands: ", strcat_array(DisabledServices, " | "), "\n",
+            "• What: ", tostring(ScDisableCount), " service(s) disabled: ", strcat_array(ServicesList, ", "), "\n",
+            "• HighRiskHit: ", iff(HighRiskHit, "Yes", "No"),
+            iff(array_length(HighRiskServices) > 0, strcat(" (matched: ", strcat_array(HighRiskServices, ", "), ")"), ""), "\n", 
+            "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+            "• Parent(s): ", strcat_array(Parents, " | "), "\n",
+            "• Device: ", DeviceId, "\n",
+            "🛑 Disabling security and backup services is a key ransomware tactic for evasion and impact."
+        );
+// 4️⃣ Event logs cleared using wevtutil
+let EventLogClearing =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where ProcessCommandLine has_all ("wevtutil", "cl")
+    | extend Parent = tostring(InitiatingProcessFileName),
+             ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Signed", "Unsigned")
+    | summarize 
+        LogClearCount   = dcount(ProcessCommandLine),
+        ClearedLogList  = make_set(strcat("[", ProcessCommandLine, "]"), 10),
+        Parents         = make_set(Parent, 5),
+        ParentSignatures= make_set(ParentSigned),
+        Accounts        = make_set(AccountName),
+        FirstSeen       = min(TimeGenerated),
+        TimeWindow      = bin(min(TimeGenerated), binSize)
+      by DeviceId
+    | where LogClearCount > 3
+    | extend 
+        Signal = "Event logs cleared via wevtutil",
+        Severity = "🔴 High",
+        PrimaryAccount = tostring(Accounts[0]),
+        Summary = strcat(
+            "🚨 Multiple event logs cleared using wevtutil\n",
+            "• Who: ", strcat_array(Accounts, ", "), "\n",
+            "• Commands: ", strcat_array(ClearedLogList, " | "), "\n",
+            "• Count: ", tostring(LogClearCount), "\n",
+            "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSignatures, ", "), ")\n",
+            "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+            "• Device: ", DeviceId, "\n",
+            "🛑 Clearing event logs is a common post-compromise activity to cover tracks."
+        );
+// 5️⃣ USN journal deleted via fsutil
+let USNJournalDeletion =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName =~ "fsutil.exe"
+    | where ProcessCommandLine has_all ("usn", "deletejournal")
+    | extend Parent = tostring(InitiatingProcessFileName),
+             ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Signed", "Unsigned")
+    | summarize 
+        FsutilDeleteCount = count(),
+        DeleteCommands = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+        Parents         = make_set(Parent, 5),
+        ParentSignatures= make_set(ParentSigned),
+        FirstSeen = min(TimeGenerated),
+        Accounts = make_set(AccountName),
+        TimeWindow = bin(min(TimeGenerated), binSize)
+        by DeviceId
+    | where FsutilDeleteCount > 0
+    | extend 
+        Signal = "Volume journal deletion via fsutil",
+        Severity = "🔴 High",
+        PrimaryAccount = tostring(Accounts[0]),
+        Summary = strcat(
+            "🚨 USN journal deletion via fsutil detected\n",
+            "• Who: ", strcat_array(Accounts, ", "), "\n",
+            "• Commands: ", strcat_array(DeleteCommands, " | "), "\n",
+            "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+            "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSignatures, ", "), ")\n",
+            "• Device: ", DeviceId, "\n",
+            "🛑 Deleting the USN journal helps ransomware avoid forensic recovery."
+        );
+// 6️⃣ Shadow copy deletion via vssadmin or wmic or diskshadow
+let ShadowCopyDeletion =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where tolower(FileName) in~ ("vssadmin.exe","diskshadow.exe","wmic.exe")
+// normalize
+| extend cmd = tolower(ProcessCommandLine),
+         Initiator = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName, AccountName, ""),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid","Signed","Unsigned/Unknown"),
+         ProcFolder = tostring(InitiatingProcessFolderPath)
+// vssadmin delete shadows (all /for= /quiet etc)
+| where (FileName =~ "vssadmin.exe" and cmd matches regex @"\bdelete\b.*\bshadows?\b")
+   // diskshadow with script that contains delete shadows or 'delete shadows all' (script passed via -s or /s)
+   or (FileName =~ "diskshadow.exe" and cmd matches regex @"(?i)\b(-s|/s|/script|/s)\b")
+   // wmic shadowcopy delete variants
+   or (FileName =~ "wmic.exe" and cmd matches regex @"(?i)\bshadowcopy\b.*\b(delete|call delete)\b")
+| summarize
+    DeleteCount = count(),
+    Commands = make_set(ProcessCommandLine, 10),
+    Accounts = make_set(Initiator, 5),
+    Parents  = make_set(Parent, 5),
+    ParentSignatures = make_set(ParentSigned, 5),
+    ProcFolders = make_set(ProcFolder, 5),
+    FirstSeen = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where DeleteCount > 0
+| extend
+    Signal = "Shadow Copy Deletion (vssadmin/diskshadow/wmic)",
+    Severity = "🔴 High",
+    PrimaryAccount = tostring(Accounts[0])
+| extend  Summary = strcat(
+      "🚨 Shadow copy deletion detected (vssadmin/diskshadow/wmic)\n",
+      "• Who: ", tostring(PrimaryAccount), "\n",
+      "• Commands: ", strcat_array(Commands, " | "), "\n",
+      "• Count: ", tostring(DeleteCount), "\n",
+      "• Parent(s): ", strcat_array(Parents, " | "), " (Signed: ", strcat_array(ParentSignatures, ", "), ")\n",
+      "• Parent folders: ", strcat_array(ProcFolders, " | "), "\n",
+      "• When: ", format_datetime(FirstSeen, 'yyyy-MM-dd HH:mm:ss'), "\n",
+      "• Device: ", DeviceId, " (", DeviceName, ")\n",
+      "🛑 Shadow copy deletion is a key step used by ransomware to prevent recovery and avoid detection."
+    );
+// 7️⃣ File hiding via attrib.exe
+let IsUserWritablePath = (s:string) { 
+  tolower(s) has @"\appdata\" or tolower(s) has @"\temp\" or tolower(s) has @"\roaming\" or
+  tolower(s) has @"\downloads\" or tolower(s) has @"\users\public\" or tolower(s) has @"\programdata\"
+};
+let IsScriptOrBinary = (s:string) { tolower(s) matches regex @"(?i)\.(ps1|psm1|bat|cmd|vbs|js|jse|wsf|exe|dll|scr)\b" };
+let AttribHideUsage =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "attrib.exe"
+| where ProcessCommandLine has "+h"
+// contexte suspect
+| where IsUserWritablePath(ProcessCommandLine) or IsScriptOrBinary(ProcessCommandLine)
+| extend Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Signed", "Unsigned")
+| summarize 
+    HideCmdCount = count(),
+    Commands     = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents      = make_set(Parent, 5),
+    ParentSigs   = make_set(ParentSigned),
+    FirstSeen    = min(TimeGenerated)
+  by DeviceId, DeviceName, AccountName, TimeWindow = bin(TimeGenerated, binSize)
+// seuils : plus bas si contexte suspect
+| where HideCmdCount >= 3
+| extend 
+  Signal = "File Hiding via attrib.exe",
+  PrimaryAccount = AccountName,
+  Severity = "🟡 Low",
+  Summary = strcat(
+    "⚠️ Potential file hiding attempt using attrib (+h)", "\n",
+    "• Who: ", AccountName, "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSigs, ", "), ")", "\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Count (within 10 min): ", tostring(HideCmdCount), "\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")", "\n",
+    "🛑 Attackers use +h (often with +s/+r) to hide payloads or staging files."
+  );
+// 8️⃣ Defender tampering via PowerShell
+let DefenderTampering =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where FileName in~ ("powershell.exe", "powershell_ise.exe")
+    | where ProcessCommandLine has_any ("set-mppreference","add-mppreference","remove-mppreference","-exclusionpath","-exclusionprocess",
+    "-exclusionextension","-disablerealtimemonitoring","-disableioavprotection","-disablescriptscanning")
+    //Filtre bénin
+    | where ProcessCommandLine has "jetbrains\rider\r2r"
+    | summarize 
+        TamperCount = count(),
+        TamperCommands = make_set(ProcessCommandLine, 5),
+        FirstSeen = min(TimeGenerated),
+        TimeWindow = bin(min(TimeGenerated), binSize)
+        by DeviceId, AccountName
+    | extend 
+        Signal = "Tampering with Microsoft Defender via PowerShell",
+        PrimaryAccount = AccountName,
+        Severity = "🔴 High",
+        Summary = strcat(
+            "🚨 Attempt to disable or reconfigure Microsoft Defender via PowerShell\n",
+            "• Who: ", AccountName, "\n",
+            "• Commands: ", strcat_array(TamperCommands, " | "), "\n",
+            "• Count: ", tostring(TamperCount), "\n",
+            "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+            "• Device: ", DeviceId, "\n",
+            "🛑 These actions aim to disable antivirus protections and avoid detection during ransomware execution."
+        );
+// 9️⃣ Attempt to disable Cortex XDR
+let CortexTampering =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| extend cmd = tolower(ProcessCommandLine)
+| extend enc = extract(@"(?i)(?:-enc|-encodedcommand)\s+([A-Za-z0-9+/=]{20,})", 1, cmd)
+| extend decoded = iff(isnotempty(enc), base64_decode_tostring(enc), "")
+| extend hay = strcat(cmd, " ", tolower(decoded))
+| where
+    // sc.exe : stop / config start= disabled / delete
+    (FileName =~ "sc.exe" and hay matches regex @"\bsc(\.exe)?\s+(stop|config|delete)\b" and (hay has_any ("cyveraservice","traps","palo alto cortex xdr","cortex xdr")))
+    or
+    // net.exe : net stop <service>
+    (FileName =~ "net.exe" and hay matches regex @"\bnet(\.exe)?\s+stop\b" and hay has_any ("cyveraservice","traps","palo alto cortex xdr","cortex xdr"))
+    or
+    // taskkill.exe : /f et cible XDR
+    (FileName =~ "taskkill.exe" and hay has "/f" and (hay has_any ("cyserver.exe","cyveraservice.exe","traps.exe")))
+    or
+    // PowerShell : Stop/Set-Service sur XDR, ou pilotage de sc/taskkill
+    ((FileName in~ ("powershell.exe","pwsh.exe")) and (
+        hay matches regex @"\bstop-service\b.*\b(cyvera|traps|xdr)\b"
+        or (hay matches regex @"\bset-service\b.*\b(startuptype|status)\b.*\b(disabled|stopped)\b" and hay has_any ("cyvera","traps","xdr"))
+        or (hay has " sc " and hay has_any ("cyveraservice","traps","palo alto cortex xdr","cortex xdr"))
+        or (hay has " taskkill " and hay has_any ("cyserver.exe","cyveraservice.exe","traps.exe"))
+    ))
+| extend Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid", "Signed", "Unsigned/Unknown")
+| summarize
+    AttemptCount   = count(),
+    TamperCommands = make_set(ProcessCommandLine, 5),
+    Parents        = make_set(Parent, 5),
+    ParentSigs     = make_set(ParentSigned),
+    Accounts       = make_set(AccountName),
+    FirstSeen      = min(TimeGenerated)
+  by Signal = "Attempt to Disable Cortex XDR", DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where AttemptCount > 0
+| extend PrimaryAccount = tostring(Accounts[0])
+| extend
+  Severity = "🔴 High",
+  Summary = strcat(
+    "🚨 Possible attempt to disable or kill Cortex XDR detected\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSigs, ", "), ")\n",
+    "• Commands: ", strcat_array(TamperCommands, " | "), "\n",
+    "• Count: ", tostring(AttemptCount), "\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Administrative actions targeting Cyvera/Traps services/processes are typical pre-encryption evasion."
+  );
+// 🔟 Suspicious VPN config changes
+let VPNConfigChange =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(timeRange)
+    | where ProcessCommandLine has_any ("Add-VpnConnection", "Set-VpnConnection", "rasdial", "netsh interface set", "netsh interface add")
+    | where FileName !in~ ("PanGPA.exe", "PanSupport.exe") 
+    | where ProcessCommandLine !has "show "
+    | extend Parent       = tostring(InitiatingProcessFileName),
+             ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid","Signed","Unsigned")
+    | summarize 
+        Count = count(),
+        Commands = make_set(ProcessCommandLine, 5),
+        FirstSeen = min(TimeGenerated),
+        Parents    = make_set(Parent, 5),
+        Signatures = make_set(ParentSigned),
+        TimeWindow = bin(min(TimeGenerated), binSize)
+        by Signal = "VPN Configuration Command (Suspicious)", DeviceId, AccountName
+    | extend 
+        PrimaryAccount = AccountName,
+        Severity = "🟠 Medium",
+        Summary = strcat(
+            "⚠️ Manual VPN configuration command detected on endpoint\n",
+            "• Who: ", AccountName, "\n",
+            "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+            "• Device: ", DeviceId, "\n",
+            "• Commands: ", strcat_array(Commands, " | "), "\n",
+            "• Count: ", tostring(Count), "\n",
+            "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(Signatures, ", "), ")", "\n",
+            "🛑 These commands may indicate an attempt to create or modify a VPN connection manually, ",
+            "possibly to establish unauthorized remote access or tunnel out to a C2 server."
+        );
+//11) Audit policy disabled via audipol
+let AuditPolicyDisabled =
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName =~ "auditpol.exe"
+| extend cmd = tolower(ProcessCommandLine),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSigned = iff(InitiatingProcessSignatureStatus == "Valid","Signed","Unsigned/Unknown")
+| where cmd has " /set " and (cmd has_any ("success:disable","failure:disable","no auditing") 
+  or cmd matches regex @"(?i)/category:.*\b(no auditing|disable)\b"or cmd matches regex @"(?i)/subcategory:.*\b(no auditing|disable)\b")
+| where not(Parent in~ ("ccmexec.exe","intunemanagementextension.exe","softwarecenter.exe","gpscript.exe") and cmd has_any (" /r "," /get "))
+| summarize
+    EventCount = count(),
+    Commands   = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents    = make_set(Parent, 5),
+    ParentSigs = make_set(ParentSigned),
+    Accounts   = make_set(AccountName),
+    FirstSeen  = min(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| where EventCount > 0
+| extend
+  Signal = "Audit policy disabled (auditpol)",
+  Severity = "🔴 High",
+  PrimaryAccount = tostring(Accounts[0])
+| extend
+  Summary = strcat(
+    "🚨 Audit policy disabled via auditpol\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), " (Signature: ", strcat_array(ParentSigs, ", "), ")\n",
+    "• Commands: ", strcat_array(Commands, " | "), "\n",
+    "• Count: ", tostring(EventCount), "\n",
+    "• When: ", format_datetime(FirstSeen, "yyyy-MM-dd HH:mm:ss"), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Disabling Success/Failure auditing or setting 'No Auditing' suppresses telemetry and hides attacker activity."
+  );
+//12) Disabling the firewall
+let FirewallDisabled=
+DeviceProcessEvents
+| where TimeGenerated > ago(timeRange)
+| where FileName in~ ("powershell.exe","pwsh.exe","netsh.exe","net.exe","cmd.exe")
+| extend cmd = tolower(tostring(ProcessCommandLine)),
+         Parent = tostring(InitiatingProcessFileName),
+         ParentSignatureValid = iff(InitiatingProcessSignatureStatus == "Valid", true, false),
+         InitiatorAccount = coalesce(InitiatingProcessAccountName, AccountName)
+// patterns qui désactivent le firewall
+| where 
+    cmd matches regex @"(?i)set-?netfirewallprofile\b.*-enabled\s+false"
+    or cmd contains "advfirewall set allprofiles state off"
+    or cmd matches regex @"(?i)netsh\s+advfirewall\s+set\s+(domainprofile|privateprofile|publicprofile)\s+state\s+off"
+    or cmd contains "set allprofiles state off"
+    or cmd contains "netsh firewall set opmode"
+    or cmd contains "disable-firewall"
+// exclure lectures / get show
+| where not(cmd contains "show" or cmd contains "get-netfirewallrule" or cmd contains "get-netfirewallprofile")
+| extend HasEncodedFlag = (cmd contains "-encodedcommand") or (cmd contains "-enc ")
+| summarize 
+    Count = count(),
+    SampleCmds = make_set(strcat("[", ProcessCommandLine, "]"), 5),
+    Parents = make_set(Parent, 5),
+    AnyParentSignatureValid = any(ParentSignatureValid),
+    AnyEncoded = any(HasEncodedFlag),
+    Accounts = make_set(InitiatorAccount, 5),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated)
+  by DeviceId, DeviceName, TimeWindow = bin(TimeGenerated, binSize)
+| extend Severity = case(AnyParentSignatureValid == false, "🔴 High",AnyEncoded == true, "🔴 High", Count >= 3, "🔴 High","🟠 Medium"),
+PrimaryAccount = tostring(Accounts[0])
+| extend Summary = strcat(
+    "🚨 Firewall disable detected\n",
+    "• Who: ", PrimaryAccount, "\n",
+    "• What: ", tostring(Count), " detected command(s)\n",
+    "• Commands: ", strcat_array(SampleCmds, " | "), "\n",
+    "• Parent(s): ", strcat_array(Parents, " | "), "\n",
+    "• Parent signed?: ", tostring(AnyParentSignatureValid), "\n",
+    "• Encoded?: ", tostring(AnyEncoded), "\n",
+    "• When: ", format_datetime(FirstSeen, 'yyyy-MM-dd HH:mm:ss'), " → ", format_datetime(LastSeen, 'yyyy-MM-dd HH:mm:ss'), "\n",
+    "• Device: ", DeviceId, " (", DeviceName, ")\n",
+    "🛑 Disabling firewall can allow exfiltration/C2 or evade detection."
+);
+// 🔄 Union
+let BaseAlerts =
+    union ExcessiveTaskkill_Strict, RepeatedNetStop, ServicesDisabledSC, EventLogClearing, USNJournalDeletion, ShadowCopyDeletion, AttribHideUsage, DefenderTampering, CortexTampering, VPNConfigChange,AuditPolicyDisabled, FirewallDisabled
+    | extend JoinKey = tolower(PrimaryAccount);
+let IdxIdentity =
+(
+    IdentityInfo
+    | where TimeGenerated > ago(90d)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN, AccountName, AccountDomain
+    | extend KeyCandidates = pack_array(
+        tolower(tostring(AccountUPN)),
+        tolower(tostring(AccountName)),
+        tolower(strcat(tostring(AccountDomain), "\\", tostring(AccountName))),
+        tolower(tostring(MailAddress))
+      )
+    | mv-expand Key = KeyCandidates to typeof(string)
+    | where isnotempty(Key)
+    | summarize UserFullName = any(AccountDisplayName) by Key
+);
+BaseAlerts
+| join kind=leftouter IdxIdentity on $left.JoinKey == $right.Key
+| extend UserFullName = tostring(coalesce(UserFullName, ""))
+| project TimeWindow, DeviceId, DeviceName, PrimaryAccount, UserFullName, Signal, Severity, Summary
+
+
+
+
+
+
+
