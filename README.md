@@ -12,3 +12,7 @@ Repository containing detection rules, investigation playbooks and remediation g
 1. Accelerate detection of ransomware TTPs across the kill chain.
 2. Provide clear investigation steps and fast remediation actions.
 3. Reduce false positives with tuned thresholds and exclusions.
+
+## Disclaimer
+The defense created is tunned for a special environment, review the fale positif filters (exclusion) depending on your environment if you want to use it.
+
